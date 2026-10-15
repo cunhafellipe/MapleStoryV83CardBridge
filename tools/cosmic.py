@@ -2167,6 +2167,8 @@ def enable_series_one(directory, meta, products):
                     "type=volume,src="
                     + meta["project"]
                     + "_card_state,dst=/opt/card/state",
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=272m,mode=1777",
                     "--env-file",
                     str(path),
                     "--entrypoint",

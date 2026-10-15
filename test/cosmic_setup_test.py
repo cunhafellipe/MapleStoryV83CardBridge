@@ -378,6 +378,10 @@ class SetupSafety(unittest.TestCase):
                 )
                 command = run.call_args.args[0]
                 self.assertEqual(
+                    command[command.index("--tmpfs") + 1],
+                    "/tmp:rw,noexec,nosuid,size=272m,mode=1777",
+                )
+                self.assertEqual(
                     command[:7],
                     [
                         "docker",
