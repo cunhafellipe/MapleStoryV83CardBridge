@@ -45,8 +45,13 @@ class SetupSafety(unittest.TestCase):
                         writer.execute("CREATE TABLE checkpointed(id INTEGER)")
                         writer.commit()
                         writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        writer.execute("CREATE TABLE " + table + "(id INTEGER)")
-                        writer.execute("INSERT INTO " + table + " VALUES(1)")
+                        if table == "framework_state":
+                            writer.execute("CREATE TABLE framework_state(id INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL,body TEXT NOT NULL)")
+                            writer.execute("INSERT INTO framework_state VALUES(1,1,'opaque-fixture')")
+                        else:
+                            writer.execute("CREATE TABLE orders(id INTEGER)")
+                            writer.execute("CREATE TABLE registrations(code_id TEXT)")
+                            writer.execute("INSERT INTO orders VALUES(1)")
                         writer.commit()
                         if active:
                             writers.append(writer)
@@ -757,7 +762,7 @@ class SetupSafety(unittest.TestCase):
                     database = sqlite3.connect(":memory:")
                     if name == "framework.sqlite":
                         database.executescript(
-                            "CREATE TABLE framework_state(id INTEGER PRIMARY KEY,body TEXT); INSERT INTO framework_state VALUES(1,'fixture');"
+                            "CREATE TABLE framework_state(id INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL,body TEXT NOT NULL); INSERT INTO framework_state VALUES(1,1,'fixture');"
                         )
                     else:
                         database.executescript(
@@ -1123,6 +1128,53 @@ class SetupSafety(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 setup.validate_backup(p)
 
+
+
+class NormalizedFrameworkCompatibility(unittest.TestCase):
+    def test_normalized_schema_guards_accept_two_through_eight_and_reject_corruption(self):
+        for version in range(2, 9):
+            with self.subTest(version=version):
+                con = sqlite3.connect(":memory:")
+                try:
+                    con.executescript(setup.normalized_schema_sql(version))
+                    marker = json.dumps({"format": "digital-card.indexed-state", "version": version, "recordKeys": "blind-v1"})
+                    con.execute("INSERT INTO framework_meta VALUES(1,?,?)", (version, marker))
+                    con.execute("PRAGMA user_version=" + str(version))
+                    setup.validate_database_schema(con, True)
+                    con.execute("UPDATE framework_meta SET schema_version=99")
+                    with self.assertRaises(RuntimeError): setup.validate_database_schema(con, True)
+                    con.execute("UPDATE framework_meta SET schema_version=?", (version,))
+                    con.execute("DROP INDEX framework_order")
+                    with self.assertRaises(RuntimeError): setup.validate_database_schema(con, True)
+                finally: con.close()
+
+    @unittest.skipUnless(setup.shutil.which("node"), "Requires Node.js with node:sqlite")
+    def test_actual_encrypted_schema_eight_backup_and_recovery_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); state = root / "state"; work = root / "work"
+            state.mkdir(); work.mkdir()
+            module = (setup.ROOT / "node_modules/@digital-card/framework/src/sqlite.js").as_uri()
+            script = "import{SQLiteStore}from" + json.dumps(module) + ";const s=new SQLiteStore(process.argv[1],{encryptionKey:Buffer.alloc(32,7)});s.close();"
+            setup.subprocess.run([setup.shutil.which("node"),"--input-type=module","-e",script,str(state / "framework.sqlite")],check=True,capture_output=True)
+            bridge = sqlite3.connect(state / "bridge.sqlite")
+            bridge.executescript("CREATE TABLE orders(id TEXT PRIMARY KEY); CREATE TABLE registrations(code_id TEXT PRIMARY KEY); PRAGMA user_version=1;")
+            bridge.close()
+            con=sqlite3.connect(state / "framework.sqlite")
+            try: setup.validate_database_schema(con, True)
+            finally: con.close()
+            archive = root / "state.tar.gz"
+            with tarfile.open(archive, "w:gz") as files:
+                for name in ["framework.sqlite", "bridge.sqlite"]:
+                    files.add(state / name, arcname=name)
+            setup.validate_state_databases(archive)
+            for future in [False, True]:
+                if future:
+                    bridge=sqlite3.connect(state / "bridge.sqlite");bridge.execute("PRAGMA user_version=2");bridge.close()
+                before={p.name:setup.file_hash(p) for p in state.iterdir()}
+                result=setup.subprocess.run([setup.shutil.which("node"),"--input-type=module","-e",setup.recovery_state_probe_script(),str(state),str(work)],capture_output=True,text=True)
+                self.assertEqual(result.returncode == 0, not future, result.stderr)
+                self.assertEqual(before,{p.name:setup.file_hash(p) for p in state.iterdir()})
+                self.assertEqual(list(work.iterdir()),[])
 
 if __name__ == "__main__":
     unittest.main()

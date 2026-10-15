@@ -6,7 +6,7 @@ import {
   generateSeriesOneCode,
   normalizeCode,
 } from "../src/series-one.mjs";
-import { operator } from "../src/library.mjs";
+import { Library, operator } from "../src/library.mjs";
 import { hash, mac, verifyRequest } from "../src/protocol.mjs";
 import { createLibraryHttp } from "../src/http.mjs";
 import { Journal } from "../src/journal.mjs";
@@ -423,6 +423,50 @@ test("purchase registration stays scoped and recovery backs off immediately duri
     x.library.game = original;
     await x.library.recover();
     assert.equal(x.journal.pending().length, 0);
+  } finally {
+    x.close();
+  }
+});
+
+test("startup backfills existing pack completion reservations without changing ownership", async () => {
+  const x = fixture();
+  try {
+    await x.buy("backfill-startup");
+    const before = x.store.read((s) => ({
+      copies: s.copies,
+      packs: s.packs,
+      balances: s.balances,
+    }));
+    x.store.transact((s) => {
+      s.completionObligations = {};
+    });
+    assert.throws(
+      () =>
+        x.core.grantCurrency(operator, {
+          userId: x.library.actor(x.person).userId,
+          currencyId: "nx",
+          amount: 1,
+          reason: "completion migration fixture",
+          key: "before-backfill",
+        }),
+      (e) => e.code === "COMPLETION_MIGRATION_REQUIRED",
+    );
+    const restored = new Library({
+      framework: x.core,
+      store: x.store,
+      journal: x.journal,
+      game: x.game,
+    });
+    restored.quote(x.person, { productId: "first-light" });
+    assert.deepEqual(
+      x.store.read((s) => ({
+        copies: s.copies,
+        packs: s.packs,
+        balances: s.balances,
+      })),
+      before,
+    );
+    assert.equal(x.core.backfillCompletionReservations(operator).count, 0);
   } finally {
     x.close();
   }

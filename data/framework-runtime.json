@@ -1,12 +1,12 @@
 {
   "name": "@digital-card/framework",
   "version": "0.2.0",
-  "edition": "generated-code-1",
-  "sourceCommit": "7423262fedeb3116dff2dd178761e54704ba3169",
+  "edition": "indexed-storage-8",
+  "sourceCommit": "2423fa6f700e2e7627c31f075a7ddd80d641e203",
   "license": "MIT",
-  "url": "https://codeload.github.com/zkkng/DigitalCardFramework/tar.gz/7423262fedeb3116dff2dd178761e54704ba3169",
-  "sha256": "21dc725cc3191e829cfb285a32255f4e762d0d983d805a5114bfe32e4b861e99",
-  "integrity": "sha512-fd5a6yfcdwQ1eDJXgQBuehnWt+oUDVTJcNTBbx9aTjNfTBcSKIh0W2OTHoUJrMPXnOYvIuOC79HZuCtP8NzyGQ==",
-  "bytes": 890911,
+  "url": "https://codeload.github.com/zkkng/DigitalCardFramework/tar.gz/2423fa6f700e2e7627c31f075a7ddd80d641e203",
+  "sha256": "63c232553ad0f7962b00762ae7dea9694cc383dbb4e26c7ddcaaa80822efdad6",
+  "integrity": "sha512-ESeKPZ28vvx1o9xh8al+V6e+i5h5VFQS45rlYD9ekL0u8Zdg1WmotSaIkQwyU8M5CpkIfW2vuR4nz6x5ho8xYg==",
+  "bytes": 4088539,
   "sourceRepository": "https://github.com/zkkng/DigitalCardFramework"
 }

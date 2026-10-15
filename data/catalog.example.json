@@ -1,6 +1,11 @@
 {
   "version": 2,
   "name": "Shapes starter collection",
+  "capabilities": {
+    "version": 1,
+    "preset": "packCollection",
+    "primitives": { "issuance": true, "settlement": true }
+  },
   "features": {
     "cardTrading": false,
     "currencyTrading": false,

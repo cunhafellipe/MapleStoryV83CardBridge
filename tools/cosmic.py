@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Prepare, build, start and operate a complete Cosmic card installation."""
+from contextlib import closing
 from pathlib import Path
 import argparse
 import base64
@@ -1237,6 +1238,165 @@ def validate_backup(path):
     return path
 
 
+def normalized_schema_sql(version):
+    if version not in range(2, 9):
+        raise RuntimeError("Unsupported normalized framework schema.")
+    base = r"""
+CREATE TABLE framework_meta(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL,codec_check TEXT NOT NULL) STRICT;
+CREATE TABLE framework_fields(name TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('object','array','scalar')),payload TEXT) STRICT;
+CREATE TABLE framework_entities(collection TEXT NOT NULL,entity_key TEXT NOT NULL,ordinal INTEGER NOT NULL,payload TEXT NOT NULL,
+ identity_hash TEXT,owner_id TEXT,holder_id TEXT,state TEXT,status TEXT,card_id TEXT,variant_id TEXT,line_id TEXT,rarity_id TEXT,pool_id TEXT,provider_id TEXT,
+ created_at TEXT NOT NULL,name_sort TEXT NOT NULL,search_text TEXT NOT NULL,card_type TEXT NOT NULL,PRIMARY KEY(collection,entity_key),
+ FOREIGN KEY(collection) REFERENCES framework_fields(name) ON DELETE CASCADE) STRICT;
+CREATE UNIQUE INDEX framework_identity ON framework_entities(collection,identity_hash) WHERE identity_hash IS NOT NULL;
+CREATE INDEX framework_owner ON framework_entities(collection,owner_id,created_at DESC,entity_key);
+CREATE INDEX framework_owner_state ON framework_entities(collection,owner_id,state,created_at DESC,entity_key);
+CREATE INDEX framework_owner_status ON framework_entities(collection,owner_id,status,created_at DESC,entity_key);
+CREATE INDEX framework_owner_name ON framework_entities(collection,owner_id,state,name_sort,entity_key);
+CREATE INDEX framework_owner_variant ON framework_entities(collection,owner_id,state,variant_id,created_at DESC,entity_key);
+CREATE INDEX framework_holder ON framework_entities(collection,holder_id,created_at DESC,entity_key);
+CREATE INDEX framework_holder_status ON framework_entities(collection,holder_id,status,created_at DESC,entity_key);
+CREATE INDEX framework_pool_status ON framework_entities(collection,pool_id,status,created_at DESC,entity_key);
+CREATE INDEX framework_provider_state ON framework_entities(collection,provider_id,state,entity_key);
+CREATE INDEX framework_provider_cursor ON framework_entities(collection,provider_id,entity_key,state);
+CREATE INDEX framework_status ON framework_entities(collection,status,created_at DESC,entity_key);
+CREATE INDEX framework_created ON framework_entities(collection,created_at DESC,entity_key);
+CREATE INDEX framework_name ON framework_entities(collection,name_sort,entity_key);
+CREATE INDEX framework_order ON framework_entities(collection,ordinal);
+"""
+    sql = base + (
+        r"""
+CREATE TABLE framework_code_holders(collection TEXT NOT NULL CHECK(collection='codes'),code_id TEXT NOT NULL,holder_hash TEXT NOT NULL,copy_id TEXT,
+ PRIMARY KEY(holder_hash,code_id),FOREIGN KEY(collection,code_id) REFERENCES framework_entities(collection,entity_key) ON DELETE CASCADE) STRICT;
+CREATE INDEX framework_code_membership ON framework_code_holders(collection,code_id);
+"""
+        if version >= 3
+        else ""
+    )
+    if version >= 4:
+        sql += "CREATE INDEX framework_notification_owner_order ON framework_entities(collection,owner_id,ordinal,entity_key);"
+    if version >= 5:
+        sql += r"""
+CREATE TABLE framework_action_work(collection TEXT NOT NULL CHECK(collection='actionJobs'),job_key TEXT NOT NULL,ordinal INTEGER NOT NULL,due_at INTEGER,reservation_key TEXT,active INTEGER NOT NULL CHECK(active IN (0,1)),
+ PRIMARY KEY(job_key),FOREIGN KEY(collection,job_key) REFERENCES framework_entities(collection,entity_key) ON DELETE CASCADE) STRICT;
+CREATE INDEX framework_action_due ON framework_action_work(due_at,ordinal,job_key) WHERE due_at IS NOT NULL;
+CREATE INDEX framework_action_reservation ON framework_action_work(reservation_key,active);
+"""
+    if version >= 6:
+        sql += r"""
+CREATE TABLE framework_expiration_work(collection TEXT NOT NULL CHECK(collection IN ('trades','listings')),entity_key TEXT NOT NULL,ordinal INTEGER NOT NULL,due_at INTEGER,
+ PRIMARY KEY(collection,entity_key),FOREIGN KEY(collection,entity_key) REFERENCES framework_entities(collection,entity_key) ON DELETE CASCADE) STRICT;
+CREATE INDEX framework_expiration_due ON framework_expiration_work(collection,due_at,ordinal,entity_key) WHERE due_at IS NOT NULL;
+"""
+    if version >= 7:
+        sql += "CREATE INDEX framework_owner_card_state ON framework_entities(collection,owner_id,card_id,state);"
+    if version >= 8:
+        sql += "CREATE INDEX framework_code_prefix_expiry ON framework_entities(collection,pool_id,status,created_at,name_sort,entity_key,variant_id); CREATE UNIQUE INDEX framework_code_order_unique ON framework_entities(name_sort) WHERE collection='_codeStock' AND name_sort!='';"
+    return sql
+
+
+def framework_schema_entries(con):
+    return [
+        (kind, name, table, re.sub(r"\s+", " ", sql).strip() if sql else None)
+        for kind, name, table, sql in con.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+        )
+        if name.startswith("framework_") or table.startswith("framework_")
+    ]
+
+
+def validate_codec_header(body, version):
+    try:
+        value = json.loads(body)
+        if type(value.get("encrypted")) is int and value["encrypted"] == 1:
+            if set(value) != {"encrypted", "iv", "tag", "data"}:
+                raise ValueError()
+            if (
+                len(base64.b64decode(value["iv"], validate=True)) != 12
+                or len(base64.b64decode(value["tag"], validate=True)) != 16
+                or not base64.b64decode(value["data"], validate=True)
+            ):
+                raise ValueError()
+        elif value != {
+            "format": "digital-card.indexed-state",
+            "version": version,
+            "recordKeys": "blind-v1",
+        }:
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError, KeyError):
+        raise RuntimeError(
+            "Backup framework authentication marker is invalid."
+        ) from None
+
+
+def validate_database_schema(con, framework):
+    version = con.execute("PRAGMA user_version").fetchone()[0]
+    tables = {
+        row[0]
+        for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    if framework:
+        if "framework_state" in tables:
+            columns = [
+                row[1] for row in con.execute("PRAGMA table_info(framework_state)")
+            ]
+            row = con.execute(
+                "SELECT schema_version,length(body) FROM framework_state WHERE id=1"
+            ).fetchone()
+            if (
+                version not in [0, 1]
+                or columns != ["id", "schema_version", "body"]
+                or [
+                    (row[1], row[2], row[5])
+                    for row in con.execute("PRAGMA table_info(framework_state)")
+                ]
+                != [
+                    ("id", "INTEGER", 1),
+                    ("schema_version", "INTEGER", 0),
+                    ("body", "TEXT", 0),
+                ]
+                or len(framework_schema_entries(con)) != 1
+                or row is None
+                or row[0] != 1
+                or not row[1]
+                or any(
+                    name.startswith("framework_") and name != "framework_state"
+                    for name in tables
+                )
+            ):
+                raise RuntimeError(
+                    "Backup framework schema is unsupported or incomplete."
+                )
+        else:
+            if version not in range(2, 9):
+                raise RuntimeError(
+                    "Backup framework schema is unsupported or incomplete."
+                )
+            with closing(sqlite3.connect(":memory:")) as model:
+                model.executescript(normalized_schema_sql(version))
+                if framework_schema_entries(con) != framework_schema_entries(model):
+                    raise RuntimeError(
+                        "Backup framework schema is unsupported or incomplete."
+                    )
+            if con.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RuntimeError(
+                    "Backup framework foreign-key relationships are invalid."
+                )
+            row = con.execute(
+                "SELECT schema_version,codec_check FROM framework_meta WHERE id=1"
+            ).fetchone()
+            if row is None or row[0] != version or not row[1]:
+                raise RuntimeError(
+                    "Backup framework schema is unsupported or incomplete."
+                )
+            if version >= 3:
+                validate_codec_header(row[1], version)
+
+    else:
+        if version not in [0, 1] or not {"orders", "registrations"} <= tables:
+            raise RuntimeError("Backup bridge schema is unsupported or incomplete.")
+
+
 def validate_state_databases(path):
     with tempfile.TemporaryDirectory(prefix="cosmic-backup-check-") as temporary:
         root = Path(temporary)
@@ -1254,7 +1414,7 @@ def validate_state_databases(path):
                         shutil.copyfileobj(incoming, outgoing)
                     (root / name).chmod(0o600)
         for name, required in [
-            ("framework.sqlite", {"framework_state"}),
+            ("framework.sqlite", set()),
             ("bridge.sqlite", {"orders", "registrations"}),
         ]:
             try:
@@ -1271,14 +1431,7 @@ def validate_state_databases(path):
                         raise RuntimeError(
                             "Backup SQLite integrity or schema check failed."
                         )
-                    if (
-                        name == "framework.sqlite"
-                        and con.execute(
-                            "SELECT COUNT(*) FROM framework_state WHERE id=1 AND length(body)>0"
-                        ).fetchone()[0]
-                        != 1
-                    ):
-                        raise RuntimeError("Backup framework state is missing.")
+                    validate_database_schema(con, name == "framework.sqlite")
                 finally:
                     con.close()
             except sqlite3.Error:
@@ -1498,27 +1651,63 @@ def recover_empty(directory, source, expected_project, relocate=False, retry=Fal
 
 
 def recovery_state_probe_script():
-    # Recover SQLite's WAL index only on disposable copies; the source remains read-only.
-    return r"""
+    # Validate opaque headers on private copies; runtime startup authenticates the encrypted state.
+    schemas = json.dumps(
+        {version: normalized_schema_sql(version) for version in range(2, 9)},
+        separators=(",", ":"),
+    )
+    return (
+        r"""
 import{copyFileSync,lstatSync,mkdtempSync,rmSync}from'node:fs';
 import{join}from'node:path';import{tmpdir}from'node:os';import{DatabaseSync}from'node:sqlite';
-let temporary,database,code='RECOVERY_COPY_UNAVAILABLE';
+const schemas=SCHEMA_MODELS;let temporary,database,code='RECOVERY_COPY_UNAVAILABLE';
+const entries=db=>db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all().filter(x=>x.name.startsWith('framework_')||x.tbl_name.startsWith('framework_')).map(x=>({...x,sql:x.sql?.replace(/\s+/g,' ').trim()}));
+function codecHeader(body,version){
+ const value=JSON.parse(body);
+ if(value?.encrypted===1){
+  const binary=(text,size)=>typeof text==='string'&&/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)&&Buffer.from(text,'base64').length===(size??Buffer.from(text,'base64').length)&&Buffer.from(text,'base64').length>0;
+  if(Object.keys(value).sort().join(',')!=='data,encrypted,iv,tag'||!binary(value.iv,12)||!binary(value.tag,16)||!binary(value.data))throw Error('INVALID_MARKER');
+ }else if(value?.format!=='digital-card.indexed-state'||value?.version!==version||value?.recordKeys!=='blind-v1'||Object.keys(value).sort().join(',')!=='format,recordKeys,version')throw Error('INVALID_MARKER');
+}
+function schema(db,framework){
+ const version=db.prepare('PRAGMA user_version').get().user_version;
+ const tables=new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(x=>x.name));
+ const columns=name=>db.prepare('PRAGMA table_info('+name+')').all().map(x=>x.name);
+ const same=(a,b)=>JSON.stringify([...a].sort())===JSON.stringify([...b].sort());
+ if(framework){
+  if(tables.has('framework_state')){
+   const row=db.prepare('SELECT schema_version,length(body) AS bytes FROM framework_state WHERE id=1').get();
+   if(![0,1].includes(version)||JSON.stringify(db.prepare('PRAGMA table_info(framework_state)').all().map(({name,type,pk})=>({name,type,pk})))!==JSON.stringify([{name:'id',type:'INTEGER',pk:1},{name:'schema_version',type:'INTEGER',pk:0},{name:'body',type:'TEXT',pk:0}])||entries(db).length!==1||!same(columns('framework_state'),['id','schema_version','body'])||!row||row.schema_version!==1||!row.bytes||[...tables].some(x=>x.startsWith('framework_')&&x!=='framework_state'))throw Error('INVALID_SCHEMA');
+  }else{
+   if(!Object.hasOwn(schemas,version)||db.prepare('PRAGMA foreign_key_check').get())throw Error('INVALID_SCHEMA');
+   const model=new DatabaseSync(':memory:');try{model.exec(schemas[version]);if(JSON.stringify(entries(db))!==JSON.stringify(entries(model)))throw Error('INVALID_SCHEMA')}finally{model.close()}
+   const row=db.prepare('SELECT schema_version,codec_check FROM framework_meta WHERE id=1').get();
+   if(!row||row.schema_version!==version||!row.codec_check)throw Error('INVALID_SCHEMA');
+   if(version>=3)codecHeader(row.codec_check,version);
+  }
+ }else if(![0,1].includes(version)||!tables.has('orders')||!tables.has('registrations'))throw Error('INVALID_SCHEMA');
+}
 try{
  const source=process.argv[1]??'/opt/card/state';temporary=mkdtempSync(join(process.argv[2]??tmpdir(),'card-recovery-'));let bytes=0;
  for(const file of ['framework.sqlite','bridge.sqlite'])for(const suffix of ['','-wal']){
   const name=file+suffix;let info;try{info=lstatSync(join(source,name))}catch(error){if(suffix&&error.code==='ENOENT')continue;throw error}
   if(!info.isFile()||(bytes+=info.size)>256*1024*1024)throw Error('INVALID_STATE');copyFileSync(join(source,name),join(temporary,name));
  }
- for(const [file,table]of[['framework.sqlite','framework_state'],['bridge.sqlite','orders']]){
+ for(const file of ['framework.sqlite','bridge.sqlite']){
   code=file==='framework.sqlite'?'RECOVERY_FRAMEWORK_UNAVAILABLE':'RECOVERY_BRIDGE_UNAVAILABLE';
   database=new DatabaseSync(join(temporary,file),{readOnly:true});
-  if(database.prepare('PRAGMA quick_check').get().quick_check!=='ok'||!database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table))throw Error('INVALID_STATE');
+  if(database.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw Error('INVALID_STATE');schema(database,file==='framework.sqlite');
   database.close();database=null;
  }
  console.log(JSON.stringify({ok:true}));
 }catch{console.error(JSON.stringify({code}));process.exitCode=1}
 finally{database?.close();if(temporary)rmSync(temporary,{recursive:true,force:true})}
-"""
+""".replace(
+            "SCHEMA_MODELS", schemas
+        )
+        .replace("REQUIRE_LEGACY", "false")
+        .replace("REQUIRE_NORMALIZED", "false")
+    )
 
 
 def resume_recovery_activation(directory, meta, source, locks):

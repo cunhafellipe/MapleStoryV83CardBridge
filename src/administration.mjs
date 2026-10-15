@@ -274,7 +274,11 @@ export class Administration {
             "The submitted preview differs from the reviewed draft.",
             409,
           );
-      if (this.revision() !== preview.adminRevision)
+      // Let the framework verify an exact committed replay after response loss.
+      if (
+        this.revision() !== preview.adminRevision &&
+        this.library.core.catalog().version <= preview.expectedVersion
+      )
         fail(
           "STALE_IMPORT",
           "Administrator policy changed; preview again.",

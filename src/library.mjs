@@ -14,6 +14,11 @@ export class Library {
     acceptedCashTypes = [1, 2, 4],
     rewardsEnabled = false,
   }) {
+    if (typeof framework?.backfillCompletionReservations !== "function")
+      throw Error(
+        "Incompatible framework runtime. Install the pinned bridge dependencies before starting.",
+      );
+    framework.backfillCompletionReservations(operator);
     this.core = framework;
     this.store = store;
     this.journal = journal;

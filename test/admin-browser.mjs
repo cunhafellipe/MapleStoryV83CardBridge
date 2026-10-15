@@ -611,12 +611,13 @@ async function realAdministration() {
         }),
       });
       purchased.push(...result.packs);
+      if (i === 10)
+        for (let opened = 0; opened < 13; opened++)
+          await x.library.open(x.person, {
+            key: "bounded-open-" + opened,
+            packId: purchased[opened].id,
+          });
     }
-    for (let i = 0; i < 13; i++)
-      await x.library.open(x.person, {
-        key: "bounded-open-" + i,
-        packId: purchased[i].id,
-      });
     await page.locator("#refresh").click();
     await page.waitForFunction(
       () => document.querySelector("#card-count").textContent === "104",

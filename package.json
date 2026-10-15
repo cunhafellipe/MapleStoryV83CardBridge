@@ -11,7 +11,7 @@
     "test:browser": "node test/starter-browser.mjs"
   },
   "dependencies": {
-    "@digital-card/framework": "https://codeload.github.com/zkkng/DigitalCardFramework/tar.gz/7423262fedeb3116dff2dd178761e54704ba3169"
+    "@digital-card/framework": "https://codeload.github.com/zkkng/DigitalCardFramework/tar.gz/2423fa6f700e2e7627c31f075a7ddd80d641e203"
   },
   "devDependencies": {
     "playwright": "1.62.1"
