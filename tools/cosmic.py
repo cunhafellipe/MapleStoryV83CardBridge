@@ -3196,24 +3196,24 @@ def main():
     backup_parser.add_argument(
         "--keep-stopped",
         action="store_true",
-        help="Take a consistent backup without restarting writers or reopening a migration fence",
+        help="Back up the stopped services and leave them stopped; keep an unfinished migration closed",
     )
     upgrade_parser = commands.add_parser("upgrade")
     migration = upgrade_parser.add_mutually_exclusive_group()
     migration.add_argument(
         "--migrate-legacy-payments",
         action="store_true",
-        help="Migrate legacy framework state into a verified recovery runtime with ingress closed until payment proof is complete",
+        help="Upgrade older payment data while keeping public access closed until outstanding payments are verified",
     )
     migration.add_argument(
         "--finish-legacy-migration",
         action="store_true",
-        help="Privately verify the recorded migration and payment closure before activation; preserve current data",
+        help="Resume the saved migration; verify all payments before reopening public access, keeping current data",
     )
     migration.add_argument(
         "--finish-upgrade",
         action="store_true",
-        help="Resume the recorded ordinary upgrade or its rollback; preserve data after activation",
+        help="Resume an interrupted upgrade or rollback; keep current data if public access has reopened",
     )
     recover = commands.add_parser("restore")
     recover.add_argument("--backup", required=True)
@@ -3245,7 +3245,7 @@ def main():
     )
     attribution = commands.add_parser(
         "attribute-legacy-payment",
-        help="Attribute one retained legacy payment from its original verified migration backup; keep ingress closed",
+        help="Verify the original account for one older payment using its saved migration backup; keep public access closed",
     )
     for name in ["order-id", "decision-key", "operator-id", "reason"]:
         attribution.add_argument("--" + name, required=True)
@@ -3257,7 +3257,7 @@ def main():
     admin.add_argument(
         "--account-id",
         type=int,
-        help="Revoke a stale grant by numeric identity, without requiring an eligible native account",
+        help="Remove website admin access by account ID, even if the game account is no longer available",
     )
     account = commands.add_parser("account")
     account.add_argument("action", choices=["create", "fund"])
@@ -3267,7 +3267,7 @@ def main():
     account.add_argument("--password-file")
     account.add_argument(
         "--request-id",
-        help="Stable funding identity; reuse after an uncertain response",
+        help="Unique ID for this credit; reuse the same ID if the response is lost",
     )
     args = parser.parse_args()
     if args.command == "install":

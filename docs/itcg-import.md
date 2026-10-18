@@ -37,7 +37,7 @@ This copies the catalog into the managed private configuration; direct-source mo
 
 For an existing managed or manual installation:
 
-1. Sign in as a website administrator and open **Administration → Import/export**.
+1. Sign in as a website administrator and open **Administration → Import & export**.
 2. Load the generated `catalog.json`, then select **Preview changes**. Review the additions, changes and any validation errors.
 3. Select **Publish reviewed changes** after reviewing the preview. Finish or recover unresolved purchases first if publication reports a conflict.
 

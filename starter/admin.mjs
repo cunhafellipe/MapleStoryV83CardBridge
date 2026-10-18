@@ -81,9 +81,9 @@ export function createAdministration({ api, current, onPublish }) {
       ["overview", "Overview"],
       ["cards", "Cards & sets"],
       ["packs", "Packs"],
-      ["import", "Import/export"],
+      ["import", "Import & export"],
       ["rewards", "Rewards"],
-      ["activity", "Activity/orders"],
+      ["activity", "Orders & activity"],
     ]
       .map(
         ([id, name]) =>
@@ -91,7 +91,7 @@ export function createAdministration({ api, current, onPublish }) {
       )
       .join(
         "",
-      )}</nav><p id="admin-status" role="status" aria-live="polite"></p><div id="admin-content"></div><div class="admin-publish panel"><div><strong id="draft-status">Live catalog</strong><p id="preview-summary" class="muted">Save form changes to your draft, then review them before publishing.</p></div><div class="actions"><button id="admin-preview" type="button">Preview changes</button><button id="admin-publish" type="button" disabled>Publish reviewed changes</button><button id="admin-discard" type="button" class="quiet">Discard draft</button></div><div id="preview-details"></div></div>`;
+      )}</nav><p id="admin-status" role="status" aria-live="polite"></p><div id="admin-content"></div><div class="admin-publish panel"><div><strong id="draft-status">Published cards and packs</strong><p id="preview-summary" class="muted">Save form changes to your draft, then review them before publishing.</p></div><div class="actions"><button id="admin-preview" type="button">Preview changes</button><button id="admin-publish" type="button" disabled>Publish reviewed changes</button><button id="admin-discard" type="button" class="quiet">Discard draft</button></div><div id="preview-details"></div></div>`;
     root.querySelectorAll("[data-tab]").forEach(
       (b) =>
         (b.onclick = () => {
@@ -121,7 +121,7 @@ export function createAdministration({ api, current, onPublish }) {
     $("admin-version").textContent = `Live version ${base.version}`;
     $("draft-status").textContent = dirty
       ? "Unpublished draft"
-      : "Live catalog · no saved changes";
+      : "Published cards and packs · no saved changes";
     $("admin-preview").disabled =
       loading || !dirty || modifiedForms.size > 0 || !allowed();
     $("admin-publish").disabled = loading || !preview || !allowed();
@@ -225,7 +225,7 @@ export function createAdministration({ api, current, onPublish }) {
         (x) => x.id === id,
       )
     )
-      throw Error("ID already exists. Choose a new stable ID.");
+      throw Error("This ID is already used. Choose a different ID.");
     return id;
   }
   function bindForm(form, save) {
@@ -315,7 +315,7 @@ export function createAdministration({ api, current, onPublish }) {
       const h = overview ?? {},
         orders = h.orders ?? {},
         rewards = h.rewards ?? {};
-      content.innerHTML = `<div class="admin-summary"><article class="panel"><h3>Game and website</h3><dl><dt>Game connection</dt><dd>${h.gameReady === undefined ? escape(h.game?.status ?? "Unknown") : h.gameReady ? "Connected" : "Unavailable · purchases paused"}</dd><dt>Database lease</dt><dd>${h.leaseReady === undefined ? "Not reported" : h.leaseReady ? "Ready" : "Unavailable"}</dd><dt>Reward callback</dt><dd>${h.callbackReady === undefined ? "Not configured" : h.callbackReady ? "Ready" : "Unavailable"}</dd><dt>Storage</dt><dd>${h.storage?.ok === undefined ? "Not reported" : h.storage.ok ? "Ready" : "Needs attention"} · ${escape(h.storage?.profile ?? "Single writer")}</dd></dl><p>Catalog version ${base.version}. Rewards ${rewards.enabled || h.rewardsEnabled ? "enabled" : "off"}.</p><button id="admin-health" class="quiet">Refresh readiness</button></article><article class="panel"><h3>Purchases that need attention</h3><p>${escape(orders.unresolved ?? h.unresolvedOrders ?? 0)} unresolved orders</p><p>Oldest unresolved: ${escape(h.oldestOrderAt ?? "None")}</p><p>${escape(h.orphanedPayments ?? 0)} unmatched payment identities. When present, new purchases pause until the original journal evidence is recovered.</p><p>Reward registrations: ${escape(h.registrations?.reduce((n, r) => n + Number(r.count ?? 0), 0) ?? 0)}</p><p>Last recovery: ${escape(recoverySummary(h.lastRecovery))}</p><p>Open Activity/orders to inspect and retry an existing purchase.</p></article></div><details><summary>Readiness details</summary><pre>${escape(JSON.stringify(h, null, 2))}</pre></details>`;
+      content.innerHTML = `<div class="admin-summary"><article class="panel"><h3>Game and website</h3><dl><dt>Game connection</dt><dd>${h.gameReady === undefined ? escape(h.game?.status ?? "Unknown") : h.gameReady ? "Connected" : "Unavailable · purchases paused"}</dd><dt>Game server write access</dt><dd>${h.leaseReady === undefined ? "Not reported" : h.leaseReady ? "Ready" : "Unavailable"}</dd><dt>Reward confirmation connection</dt><dd>${h.callbackReady === undefined ? "Not configured" : h.callbackReady ? "Ready" : "Unavailable"}</dd><dt>Storage</dt><dd>${h.storage?.ok === undefined ? "Not reported" : h.storage.ok ? "Ready" : "Needs attention"} · ${escape(h.storage?.profile ?? "Single writer")}</dd></dl><p>Catalog version ${base.version}. Rewards ${rewards.enabled || h.rewardsEnabled ? "enabled" : "off"}.</p><button id="admin-health" class="quiet">Check connections</button></article><article class="panel"><h3>Purchases that need attention</h3><p>${escape(orders.unresolved ?? h.unresolvedOrders ?? 0)} purchases needing attention</p><p>Oldest unresolved: ${escape(h.oldestOrderAt ?? "None")}</p><p>${escape(h.orphanedPayments ?? 0)} payments missing their purchase records. New purchases stay paused until an operator restores the original records.</p><p>Code registrations with the game: ${escape(h.registrations?.reduce((n, r) => n + Number(r.count ?? 0), 0) ?? 0)}</p><p>Last recovery: ${escape(recoverySummary(h.lastRecovery))}</p><p>Open Orders & activity to inspect and retry an existing purchase.</p></article></div><details><summary>Technical connection details</summary><pre>${escape(JSON.stringify(h, null, 2))}</pre></details>`;
       $("admin-health").onclick = async () => {
         const valid = guard();
         try {
@@ -332,7 +332,7 @@ export function createAdministration({ api, current, onPublish }) {
         const q = h.gameDiagnostics;
         content.insertAdjacentHTML(
           "beforeend",
-          `<article class="panel"><h3>Game reward queue</h3><p>${escape(q.pendingRewards ?? 0)} rewards pending · ${escape(q.pendingCallbacks ?? 0)} confirmations pending</p><p>Oldest pending: ${escape(q.oldestPendingAt ?? "None")} · Last attempt: ${escape(q.lastAttemptAt ?? "None")}</p><p>${escape(q.attempts ?? 0)} attempts · ${escape(q.lastError ?? "No error reported")}</p><p>Use Rewards to inspect registration delivery. Pending game confirmations retry automatically when the game connection recovers.</p></article>`,
+          `<article class="panel"><h3>Game reward queue</h3><p>${escape(q.pendingRewards ?? 0)} rewards pending · ${escape(q.pendingCallbacks ?? 0)} confirmations pending</p><p>Oldest pending: ${escape(q.oldestPendingAt ?? "None")} · Last attempt: ${escape(q.lastAttemptAt ?? "None")}</p><p>${escape(q.attempts ?? 0)} attempts · ${escape(q.lastError ?? "No error reported")}</p><p>Open Rewards to check whether codes have reached the game server. Pending game confirmations retry automatically when the game connection recovers.</p></article>`,
         );
       }
     } else if (tab === "cards") renderCards(content);
@@ -344,7 +344,7 @@ export function createAdministration({ api, current, onPublish }) {
         provider: overview?.provider,
         registrations: overview?.registrations,
       };
-      content.innerHTML = `<div class="panel"><h3>${r.enabled || overview?.rewardsEnabled ? "Configured rewards" : "No reward pool configured"}</h3><p>The default Shapes collection contains collectibles only. Reward codes require the supported Series One profile to be explicitly enabled during deployment.</p><p>Existing issued codes remain obligations when new rewards are disabled. Operators cannot reveal another account’s code or manually mark it used.</p><p><a href="https://github.com/zkkng/MapleStoryV83CardBridge/blob/main/docs/code-rules.md" target="_blank" rel="noopener noreferrer">Reward setup guide ↗</a></p><pre>${escape(JSON.stringify(r, null, 2))}</pre><h4>Reward delivery</h4><div id="admin-registrations"></div><button id="registrations-more" class="quiet" hidden>More registrations</button></div>`;
+      content.innerHTML = `<div class="panel"><h3>${r.enabled || overview?.rewardsEnabled ? "Configured rewards" : "No reward pool configured"}</h3><p>The default Shapes collection contains collectibles only. Reward codes require the supported Series One profile to be explicitly enabled during deployment.</p><p>Turning off new rewards does not cancel codes already given to players. Operators cannot reveal another account’s code or manually mark it used.</p><p><a href="https://github.com/zkkng/MapleStoryV83CardBridge/blob/main/docs/code-rules.md" target="_blank" rel="noopener noreferrer">Reward setup guide ↗</a></p><pre>${escape(JSON.stringify(r, null, 2))}</pre><h4>Reward delivery</h4><div id="admin-registrations"></div><button id="registrations-more" class="quiet" hidden>Show more reward codes</button></div>`;
       loadRegistrations();
     } else renderActivity(content);
   }
@@ -384,7 +384,7 @@ export function createAdministration({ api, current, onPublish }) {
                     {},
                   );
                   if (valid()) {
-                    status("Registration retried using its original identity.");
+                    status("Retried sending the same code to the game server.");
                     await load();
                   }
                 } catch (e) {
@@ -409,7 +409,7 @@ export function createAdministration({ api, current, onPublish }) {
     function setForm() {
       let row = draft.lines.find((x) => x.id === setSelect.value);
       $("set-editor").innerHTML =
-        `<form class="admin-form">${field("Stable set ID", "id", row?.id, "required maxlength=100 " + (row ? "readonly" : ""))}${field("Set name", "name", row?.name, "required maxlength=200")}<label>Description<textarea name="description" maxlength="2000">${escape(row?.description)}</textarea></label><p class="form-status" role="status"></p><button>Save set to draft</button></form>`;
+        `<form class="admin-form">${field("Set ID (permanent)", "id", row?.id, "required maxlength=100 " + (row ? "readonly" : ""))}${field("Set name", "name", row?.name, "required maxlength=200")}<label>Description<textarea name="description" maxlength="2000">${escape(row?.description)}</textarea></label><p class="form-status" role="status"></p><button>Save set to draft</button></form>`;
       bindForm($("set-editor").querySelector("form"), () => {
         const f = $("set-editor").querySelector("form"),
           id = validateIdentity(f, row),
@@ -444,7 +444,7 @@ export function createAdministration({ api, current, onPublish }) {
       let row = draft.cards.find((x) => x.id === cardSelect.value);
       const variants = draft.variants.filter((v) => v.cardId === row?.id);
       $("card-editor").innerHTML =
-        `<form class="admin-form">${field("Stable card ID", "id", row?.id, "required maxlength=100 " + (row ? "readonly" : ""))}${field("Card name", "name", row?.name, "required maxlength=200")}${select("Set", "lineId", draft.lines, row?.lineId)}<label>Description<textarea name="description" maxlength="2000">${escape(row?.metadata?.description)}</textarea></label>${field("Original symbol", "symbol", row?.metadata?.symbol ?? "◇", "maxlength=8")}${field("Image path (optional)", "image", row?.metadata?.image, "maxlength=2048")}<small>Use /assets/library/name.png, .jpg or .webp. The explicit iTCG scan source is also supported. Layered art and arbitrary remote hosts are not rendered.</small>${select("Variant", "variantId", [...variants, { id: "", name: "Add a new variant" }], variants[0]?.id ?? "")}${field("New variant ID (optional)", "newVariantId", "", "maxlength=100")}<small>For a new variant, leave its ID blank to use card-id.standard, or enter a unique ID up to 100 characters. Published variant rarity and card set are permanent; add a variant for a different rarity.</small>${select("Rarity", "rarityId", draft.rarities, variants[0]?.rarityId ?? draft.rarities[0]?.id)}<p class="form-status" role="status"></p><button>Save card to draft</button></form>`;
+        `<form class="admin-form">${field("Card ID (permanent)", "id", row?.id, "required maxlength=100 " + (row ? "readonly" : ""))}${field("Card name", "name", row?.name, "required maxlength=200")}${select("Set", "lineId", draft.lines, row?.lineId)}<label>Description<textarea name="description" maxlength="2000">${escape(row?.metadata?.description)}</textarea></label>${field("Card symbol", "symbol", row?.metadata?.symbol ?? "◇", "maxlength=8")}${field("Image path (optional)", "image", row?.metadata?.image, "maxlength=2048")}<small>Use /assets/library/name.png, .jpg or .webp. The explicit iTCG scan source is also supported. Layered art and arbitrary remote hosts are not rendered.</small>${select("Card version", "variantId", [...variants, { id: "", name: "Add a card version" }], variants[0]?.id ?? "")}${field("New card version ID (optional)", "newVariantId", "", "maxlength=100")}<small>For a new card version, leave its ID blank to use card-id.standard, or enter a unique ID up to 100 characters. A published card version keeps its rarity, and a published card stays in its set. Add a card version to use a different rarity.</small>${select("Rarity", "rarityId", draft.rarities, variants[0]?.rarityId ?? draft.rarities[0]?.id)}<p class="form-status" role="status"></p><button>Save card to draft</button></form>`;
       const f = $("card-editor").querySelector("form");
       f.elements.lineId.disabled = base.cards.some((c) => c.id === row?.id);
       function variantControls() {
@@ -493,7 +493,7 @@ export function createAdministration({ api, current, onPublish }) {
           publishedVariant.rarityId !== f.elements.rarityId.value
         )
           throw Error(
-            "Rarity: published variants cannot change rarity. Choose Add a new variant.",
+            "Rarity: published variants cannot change rarity. Choose Add a card version.",
           );
         const publishedCard = base.cards.find((c) => c.id === id);
         if (publishedCard && publishedCard.lineId !== f.elements.lineId.value)
@@ -552,13 +552,13 @@ export function createAdministration({ api, current, onPublish }) {
       let row = draft.products.find((x) => x.id === choice.value);
       let slots = clone(row?.slots ?? [{ id: "cards", count: 8, pool: [] }]);
       $("pack-editor").innerHTML =
-        `<form class="admin-form">${field("Stable pack ID", "id", row?.id, "required maxlength=100 " + (row ? "readonly" : ""))}${field("Pack name", "name", row?.name, "required maxlength=200")}${select("Set", "lineId", draft.lines, row?.lineId)}<label><input type="checkbox" name="enabled" ${row?.enabled !== false ? "checked" : ""}> Available for new purchases</label><small>Disabling an offer preserves existing cards and unopened packs.</small>${field("Price in selected NX balance", "amount", row?.price?.amount ?? 1000, "type=number min=1 max=100000000 required")}${field("Maximum packs per purchase", "maxQuantity", row?.maxQuantity ?? 5, "type=number min=1 max=100 required")}<h4>Draw slots</h4><p class="muted">Each slot independently draws from its selected variants. Duplicates are possible. A weight of 2 is twice as likely as a weight of 1.</p><div id="slot-editors"></div><button id="add-slot" type="button" class="quiet">Add draw slot</button><p class="form-status" role="status"></p><button>Save pack to draft</button></form>`;
+        `<form class="admin-form">${field("Pack ID (permanent)", "id", row?.id, "required maxlength=100 " + (row ? "readonly" : ""))}${field("Pack name", "name", row?.name, "required maxlength=200")}${select("Set", "lineId", draft.lines, row?.lineId)}<label><input type="checkbox" name="enabled" ${row?.enabled !== false ? "checked" : ""}> Available for new purchases</label><small>Turning this off stops new purchases. Players keep their cards and unopened packs.</small>${field("Price per pack", "amount", row?.price?.amount ?? 1000, "type=number min=1 max=100000000 required")}${field("Maximum packs per purchase", "maxQuantity", row?.maxQuantity ?? 5, "type=number min=1 max=100 required")}<h4>Card groups</h4><p class="muted">Each group picks cards from the versions below. Duplicates are possible. Higher weights make a version more likely: 2 is twice as likely as 1.</p><div id="slot-editors"></div><button id="add-slot" type="button" class="quiet">Add card group</button><p class="form-status" role="status"></p><button>Save pack to draft</button></form>`;
       const f = $("pack-editor").querySelector("form");
       function draw() {
         $("slot-editors").innerHTML = slots
           .map(
             (slot, i) =>
-              `<fieldset data-slot="${i}"><legend>Slot ${i + 1}</legend>${field("Slot ID", "slotId", slot.id, "required maxlength=100")}${field("Cards drawn", "count", slot.count, "type=number min=1 max=100 required")}<div class="slot-weights">${draft.variants
+              `<fieldset data-slot="${i}"><legend>Group ${i + 1}</legend>${field("Group ID", "slotId", slot.id, "required maxlength=100")}${field("Cards drawn", "count", slot.count, "type=number min=1 max=100 required")}<div class="slot-weights">${draft.variants
                 .map((v) => {
                   const c = draft.cards.find((c) => c.id === v.cardId),
                     p = slot.pool.find((p) => p.variantId === v.id);
@@ -566,7 +566,7 @@ export function createAdministration({ api, current, onPublish }) {
                 })
                 .join(
                   "",
-                )}</div><small>0 excludes a variant. Selected weights must be positive whole numbers.</small><button type="button" class="quiet" data-remove-slot="${i}">Remove slot</button></fieldset>`,
+                )}</div><small>Use 0 to leave a card version out. Use whole numbers of 1 or more to include it.</small><button type="button" class="quiet" data-remove-slot="${i}">Remove group</button></fieldset>`,
           )
           .join("");
         $("slot-editors")
@@ -661,7 +661,7 @@ export function createAdministration({ api, current, onPublish }) {
     edit();
   }
   function renderImport(content) {
-    content.innerHTML = `<div class="admin-editor-grid"><div class="panel"><h3>Import a catalog</h3><p>Choose a portable catalog JSON file (maximum 2 MiB). Import replaces unpublished edits and updates matching live IDs. Existing live IDs omitted from the file remain. Disable offers to retire them. Import does not publish automatically.</p><label>Catalog JSON<input id="catalog-file" type="file" accept="application/json,.json"></label><button id="import-file">Load into draft</button></div><div class="panel"><h3>Export active catalog</h3><p>Download the live catalog for reuse or review. Backups are still required to preserve accounts, purchases and private keys.</p><button id="export-catalog">Download live JSON</button></div></div>`;
+    content.innerHTML = `<div class="admin-editor-grid"><div class="panel"><h3>Import a catalog</h3><p>Choose a card-and-pack catalog file in JSON format (maximum 2 MiB). Import replaces unpublished edits and updates matching live IDs. Published cards and packs missing from the file are kept. Turn off a pack to stop selling it. Import does not publish automatically.</p><label>Catalog JSON<input id="catalog-file" type="file" accept="application/json,.json"></label><button id="import-file">Load into draft</button></div><div class="panel"><h3>Export active catalog</h3><p>Download the live catalog for reuse or review. Backups are still required to preserve accounts, purchases and private keys.</p><button id="export-catalog">Download published catalog</button></div></div>`;
     $("import-file").onclick = async () => {
       const valid = guard(),
         file = $("catalog-file").files[0];

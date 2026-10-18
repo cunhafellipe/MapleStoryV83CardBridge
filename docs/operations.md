@@ -40,7 +40,7 @@ After a confirmed debit, the framework atomically delivers the purchase or recor
 
 A ten-second recovery pass resumes unresolved orders and registration. The opening animation does not allocate anything. Closing the browser does not undo or repeat the purchase.
 
-Administration's Activity/orders view shows sanitized pending work and supports retrying the original order. A retry uses the same durable identity and concurrency guard as background recovery. Do not delete journal rows, issue a second payment, manually grant another pack, or add cash while the original order can still complete. Keep the original catalog and keys available for recovery.
+Administration's Orders & activity view shows sanitized pending work and supports retrying the original order. A retry uses the same durable identity and concurrency guard as background recovery. Do not delete journal rows, issue a second payment, manually grant another pack, or add cash while the original order can still complete. Keep the original catalog and keys available for recovery.
 
 Catalog publication is refused while purchases are unresolved. Same-version content changes are also refused. Keep original versions available until all old orders complete.
 

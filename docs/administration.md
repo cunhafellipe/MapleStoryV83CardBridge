@@ -43,13 +43,13 @@ To retire an offer, disable it and publish. Existing cards and unopened packs re
 2. Choose **Publish reviewed changes**. Publication applies the reviewed digest, version and policy only.
 3. Check the public pack list and export the active catalog if needed.
 
-If another administrator publishes first, preview again against the current version. A changed digest, expired preview, changed policy or revoked grant cannot publish. Outstanding purchases must finish before catalog publication; retry them through Activity/orders. Closing the browser or signing out discards local drafts. The active catalog persists in framework state; editing the original bootstrap catalog file does not replace it on restart.
+If another administrator publishes first, preview again against the current version. A changed digest, expired preview, changed policy or revoked grant cannot publish. Outstanding purchases must finish before catalog publication; retry them through Orders & activity. Closing the browser or signing out discards local drafts. The active catalog persists in framework state; editing the original bootstrap catalog file does not replace it on restart.
 
-**Import/export** supports complete JSON catalogs up to 2 MiB, including the optional five-set import. Loading a file creates a draft; preview and publish are still required. Preview merges matching identities and retains published entries absent from the import; disable an offer explicitly to retire it. Export downloads the active catalog, not the bootstrap file. An export is not a full installation backup.
+**Import & export** supports complete JSON catalogs up to 2 MiB, including the optional five-set import. Loading a file creates a draft; preview and publish are still required. Preview merges matching identities and retains published entries absent from the import; disable an offer explicitly to retire it. Export downloads the active catalog, not the bootstrap file. An export is not a full installation backup.
 
 ## Diagnose purchases and rewards
 
-**Overview** reports game/callback/lease health, catalog version, storage state and unresolved work. **Activity/orders** searches exact native account names, account IDs or durable order IDs and shows cash type, amount, attempts, safe errors and timestamps. **Retry this order** resumes the original purchase identity. It cannot create a replacement debit, edit a balance or reveal a code.
+**Overview** reports game/callback/lease health, catalog version, storage state and unresolved work. **Orders & activity** searches exact native account names, account IDs or durable order IDs and shows cash type, amount, attempts, safe errors and timestamps. **Retry this order** resumes the original purchase identity. It cannot create a replacement debit, edit a balance or reveal a code.
 
 Rewards are off until the [supported provider is explicitly enabled](cosmic-setup.md#install-and-verify). Rewards status describes the configured campaign; the website does not offer arbitrary item or meso editing. Registration retries use the same recovery engine. Only the owning collector can reveal a code. Game receipts control USED status; administrators cannot mark codes used or expose another player's plaintext.
 

@@ -346,7 +346,7 @@ function codes() {
     ? rows
         .map(
           (c) =>
-            `<article class="code"><div class="code-heading"><strong>${esc(c.name)}</strong><span class="badge ${c.status === "redeemed" ? "used" : ""}">${c.status === "redeemed" ? "USED" : c.status === "revoked" ? "REVOKED" : c.registration === "ready" ? "READY" : "PREPARING"}</span></div><p>Added ${esc(new Date(c.createdAt).toLocaleDateString())}</p>${["redeemed", "revoked"].includes(c.status) ? "<p>This code is no longer available to redeem.</p>" : `<button data-code="${esc(c.id)}" ${c.registration !== "ready" ? "disabled" : ""}>Reveal code</button><div class="secret"></div>`}</article>`,
+            `<article class="code"><div class="code-heading"><strong>${esc(c.name)}</strong><span class="badge ${c.status === "redeemed" ? "used" : ""}">${c.status === "redeemed" ? "USED" : c.status === "revoked" ? "CANCELLED" : c.registration === "ready" ? "READY" : "PREPARING"}</span></div><p>Added ${esc(new Date(c.createdAt).toLocaleDateString())}</p>${["redeemed", "revoked"].includes(c.status) ? "<p>This code is no longer available to redeem.</p>" : `<button data-code="${esc(c.id)}" ${c.registration !== "ready" ? "disabled" : ""}>Reveal code</button><div class="secret"></div>`}</article>`,
         )
         .join("")
     : empty(
@@ -480,7 +480,7 @@ function productMarkup(p) {
     .filter((id) => variants.get(id)?.enabled !== false && variants.get(id)?.remaining !== 0));
   const rewards = [...possible].some((id) => variants.get(id)?.codes?.length);
   const totalCards = p.slots.reduce((n, s) => n + s.count, 0);
-  return `<article class="product"><div class="pack-cover" aria-hidden="true"><div class="product-mark">◇<small>CARD PACK</small></div></div><p class="eyebrow">${esc(setName(p.lineId) === p.name ? "COLLECTIBLE PACK" : setName(p.lineId))}</p><h3>${esc(p.name)}</h3><div class="pack-meta"><span>${totalCards} cards</span><span>${rewards ? "Includes reward codes" : "Collectibles only"}</span></div><p>${possible.size} possible variants · Random draws</p><strong class="product-price">${num(p.price.amount)} <small>per pack · selected game balance</small></strong><div class="actions"><button data-product="${esc(p.id)}" ${$("product").value === p.id ? 'aria-pressed="true" class="selected"' : 'aria-pressed="false" class="quiet"'}>Choose this pack</button><button class="quiet" data-contents="${esc(p.id)}">View contents</button></div></article>`;
+  return `<article class="product"><div class="pack-cover" aria-hidden="true"><div class="product-mark">◇<small>CARD PACK</small></div></div><p class="eyebrow">${esc(setName(p.lineId) === p.name ? "COLLECTIBLE PACK" : setName(p.lineId))}</p><h3>${esc(p.name)}</h3><div class="pack-meta"><span>${totalCards} cards</span><span>${rewards ? "Includes reward codes" : "Collectibles only"}</span></div><p>${possible.size} possible card versions · Random selection</p><strong class="product-price">${num(p.price.amount)} <small>per pack · selected game balance</small></strong><div class="actions"><button data-product="${esc(p.id)}" ${$("product").value === p.id ? 'aria-pressed="true" class="selected"' : 'aria-pressed="false" class="quiet"'}>Choose this pack</button><button class="quiet" data-contents="${esc(p.id)}">View contents</button></div></article>`;
 }
 function render() {
   if (!catalog) return;
@@ -568,11 +568,11 @@ function render() {
         (b.onclick = () => {
           const p = catalog.products.find((p) => p.id === b.dataset.contents);
           $("detail-content").innerHTML =
-            `<h2>${esc(p.name)}</h2><p>${constrainedDraws(p) ? "This pack has draw constraints. Pool weights are relative preferences; actual chances can change with remaining supply and draw rules." : "Each slot draws independently. Duplicates are possible."}</p>` +
+            `<h2>${esc(p.name)}</h2><p>${constrainedDraws(p) ? "This pack has special selection rules. The numbers shown are relative weights, not fixed odds. Chances may change with remaining stock and the pack's rules." : "Each card is picked at random from its group below. You may get duplicates."}</p>` +
             p.slots
               .map(
                 (s) =>
-                  `<h3>${s.count} ${s.role === "insert" ? "insert" : "card"}${s.count === 1 ? "" : "s"}</h3><ul>` +
+                  `<h3>${s.count} ${s.role === "insert" ? "bonus card" : "card"}${s.count === 1 ? "" : "s"}</h3><ul>` +
                   s.pool
                     .filter((entry) => {
                       const variant = catalog.variants.find(

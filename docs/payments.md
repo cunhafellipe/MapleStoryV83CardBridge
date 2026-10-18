@@ -20,7 +20,7 @@ The background worker discovers unresolved native and framework operations in bo
 
 The game retains room in the original cash balance for unresolved refundable debits. Qualified native credits respect that room, including operator funding, coupons and trading proceeds. A legacy account may already lack this capacity. That obligation remains explicitly owed: the bridge cannot claim a refund until the original source was credited. Do not remove payment rows, change source, manually mark a refund or credit money while a recoverable order can still allocate.
 
-Use Administration → Activity/orders to inspect the original order and retry it. The overview shows unmatched identities and readiness details without revealing code plaintext. Back up the entire paired installation before repairing historical data. See [operations](operations.md) for consistent backup, restoration and log commands.
+Use Administration → Orders & activity to inspect the original order and retry it. The overview shows unmatched identities and readiness details without revealing code plaintext. Back up the entire paired installation before repairing historical data. See [operations](operations.md) for consistent backup, restoration and log commands.
 
 ## Adopt a proven historical delivery
 
