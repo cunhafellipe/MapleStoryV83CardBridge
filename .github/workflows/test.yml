@@ -44,12 +44,45 @@ jobs:
         include:
           - profile: collectibles
             options: ""
+            lines: 1
           - profile: series-one
             options: "--series-one"
+            lines: 1
           - profile: custom-catalog
-            options: "--catalog data/catalog.example.json"
+            options: '--catalog "$RUNNER_TEMP/custom-catalog.json"'
+            lines: 2
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Prepare a distinct original custom collection
+        if: matrix.profile == 'custom-catalog'
+        run: |
+          python3 - <<'PY'
+          import copy, json, os
+          from pathlib import Path
+          catalog = json.loads(Path("data/catalog.example.json").read_text(encoding="utf-8"))
+          catalog["name"] = "Two original shape collections"
+          catalog["lines"].append({"id": "custom-shapes", "name": "Custom shapes"})
+          variants = {}
+          for original in list(catalog["cards"]):
+              card = copy.deepcopy(original)
+              card["id"] = "custom-" + original["id"]
+              card["lineId"] = "custom-shapes"
+              catalog["cards"].append(card)
+          for original in list(catalog["variants"]):
+              variant = copy.deepcopy(original)
+              variant["id"] = "custom-" + original["id"]
+              variant["cardId"] = "custom-" + original["cardId"]
+              variants[original["id"]] = variant["id"]
+              catalog["variants"].append(variant)
+          product = copy.deepcopy(catalog["products"][0])
+          product.update(id="custom-shapes", lineId="custom-shapes", name="Custom shapes")
+          product["price"]["amount"] = 1200
+          for slot in product["slots"]:
+              for entry in slot["pool"]:
+                  entry["variantId"] = variants[entry["variantId"]]
+          catalog["products"].append(product)
+          Path(os.environ["RUNNER_TEMP"], "custom-catalog.json").write_text(json.dumps(catalog), encoding="utf-8")
+          PY
       - name: Install a complete fresh Cosmic deployment
         run: |
           umask 077
@@ -64,7 +97,7 @@ jobs:
           python3 tools/cosmic.py --directory "$RUNNER_TEMP/CosmicCardServer" start
           python3 tools/cosmic.py --directory "$RUNNER_TEMP/CosmicCardServer" smoke
       - name: Qualify owner administration, commerce, mutation restore, lease recovery and disaster rollback
-        run: python3 test/managed-lifecycle.py "$RUNNER_TEMP/CosmicCardServer" --sandbox-root "$RUNNER_TEMP"
+        run: python3 test/managed-lifecycle.py "$RUNNER_TEMP/CosmicCardServer" --sandbox-root "$RUNNER_TEMP" --expected-lines ${{ matrix.lines }}
       - name: Remove the disposable deployment
         if: always()
         run: |

@@ -8,7 +8,7 @@ Start with a sample Shapes pack and no reward pool configured. Add your own card
 
 ## Current release limits
 
-Use this release with disposable test accounts and test cash. The website and administration tools are usable, but production payment qualification is incomplete: a stock, generator or storage failure after a successful game debit can leave a purchase pending without an automatic refund. Real-client reward redemption and the complete deployment recovery matrix also need qualification. Do not use this release to take player funds.
+Use this release with disposable test accounts and test cash. The website and administration tools are usable, and allocation failures now have a durable original-balance refund protocol. Production qualification remains incomplete: concurrent HTTP load exceeds acceptable response times. Real MySQL payment tests and the managed fresh-install, restart, upgrade and failed-candidate rollback checks pass for the pinned framework runtime. Do not use this release to take player funds. See [compatibility](docs/compatibility.md) and [payment recovery](docs/payments.md).
 
 ## Get started
 

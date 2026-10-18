@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Prepare, build, start and operate a complete Cosmic card installation."""
-from contextlib import closing
 from pathlib import Path
 import argparse
+from contextlib import closing
 import base64
 import getpass
 import hashlib
@@ -87,17 +87,7 @@ def run(command, *, cwd=None, data=None, capture=False, structured_error=False):
 
 
 def private_file(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
-        raise RuntimeError("Configuration paths must not be symbolic links.")
-    if path.exists():
-        path.chmod(0o600)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(path, flags, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(data.encode() if isinstance(data, str) else data)
-        stream.flush()
-        os.fsync(stream.fileno())
+    atomic_migration_file(path, data)
 
 
 def load(directory):
@@ -261,7 +251,7 @@ def bridge_snapshot(directory):
         if (ROOT / name).is_file():
             shutil.copy2(ROOT / name, destination / name)
     (destination / "tools").mkdir(exist_ok=True)
-    for name in ["doctor.mjs", "admin.mjs", "rewards.mjs"]:
+    for name in ["doctor.mjs", "admin.mjs", "rewards.mjs", "payments.mjs"]:
         shutil.copy2(ROOT / "tools" / name, destination / "tools" / name)
     # Only distributable source enters this directory; container users must read it
     # independently of the operator's private installation umask.
@@ -726,7 +716,17 @@ def doctor(directory, meta):
     print("Ready: " + meta["origin"] + "/library/", flush=True)
 
 
-def start(directory, meta, *, allow_recovery=False):
+def start(
+    directory, meta, *, allow_recovery=False, allow_migration=False, allow_upgrade=False
+):
+    if not allow_upgrade and (directory / "upgrade.pending.json").exists():
+        raise RuntimeError(
+            "Upgrade is incomplete. Use upgrade --finish-upgrade; ordinary start cannot bypass its recorded phase."
+        )
+    if not allow_migration and (directory / "migration.pending.json").exists():
+        raise RuntimeError(
+            "Legacy migration remains closed. Use upgrade --finish-legacy-migration; ordinary start cannot expose unresolved payments."
+        )
     if not allow_recovery and (directory / "recovery.pending.json").exists():
         raise RuntimeError(
             "This disaster recovery is incomplete. Inspect the preserved recovery directory and backup before exposing services."
@@ -950,7 +950,12 @@ try{
  }
  // The source stays read-only. SQLite rebuilds its WAL index only in this private copy.
  database=new DatabaseSync(join(temporary,'bridge.sqlite'),{readOnly:true});
- console.log(database.prepare("SELECT COUNT(*) AS n FROM orders WHERE state NOT IN ('complete','rejected')").get().n);
+ const version=database.prepare('PRAGMA user_version').get().user_version;
+ const discovery=database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='payment_discovery'").get();
+ if(![0,1,2].includes(version)||(version===2&&!discovery))throw Error('INVALID_PENDING_STATE');
+ const orders=database.prepare("SELECT COUNT(*) AS n FROM orders WHERE state NOT IN ('complete','rejected','refunded')").get().n;
+ const orphans=discovery?database.prepare('SELECT COUNT(*) AS n FROM payment_discovery').get().n:0;
+ console.log(orders+orphans);
 }catch{
  console.error(JSON.stringify({code:'PENDING_STATE_UNAVAILABLE'}));process.exitCode=1;
 }finally{
@@ -959,283 +964,39 @@ try{
 """
 
 
-def backup(directory, meta, restart=True, require_resolved=False):
-    no_players(directory)
-    destination = (
-        directory
-        / "backups"
-        / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3))
-    )
-    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
-    archive_media(directory, destination / "media.tar.gz")
-    image = compose(directory, "images", "-q", "cards", capture=True).strip()
-    success = False
-    stage = "writer shutdown"
-    failure = None
-    try:
-        compose(directory, "stop", "web", "cards", "cosmic")
-        stage = "stopped game-account check"
-        no_players(directory)
-        if require_resolved:
-            stage = "stopped pending-purchase check"
-            pending = run(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "--network",
-                    "none",
-                    "--read-only",
-                    "--tmpfs",
-                    "/tmp:rw,noexec,nosuid,size=272m",
-                    "--user",
-                    "10002:10002",
-                    "--mount",
-                    "type=volume,source="
-                    + meta["project"]
-                    + "_card_state,target=/opt/card/state,readonly",
-                    "--entrypoint",
-                    "node",
-                    image,
-                    "--input-type=module",
-                    "-e",
-                    pending_guard_script(),
-                ],
-                capture=True,
-                structured_error=True,
-            ).strip()
-            if pending != "0":
-                raise RuntimeError(
-                    "Unresolved purchases remain at the stopped-writer boundary. Complete outstanding purchases before changing the installation."
-                )
-        stage = "game database dump"
-        sql = compose(
-            directory,
-            "exec",
-            "-T",
-            "db",
-            "sh",
-            "-c",
-            'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysqldump -u root --single-transaction --routines --events --triggers --hex-blob --databases cosmic --add-drop-database',
-            capture=True,
-        )
-        private_file(destination / "database.sql", sql)
-        stage = "card state archive"
-        state = run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "--user",
-                "10002:10002",
-                "--mount",
-                "type=volume,source="
-                + meta["project"]
-                + "_card_state,target=/state,readonly",
-                "--entrypoint",
-                "tar",
-                image,
-                "-C",
-                "/state",
-                "-czf",
-                "-",
-                ".",
-            ],
-            data=b"",
-            capture=True,
-        )
-        private_file(destination / "state.tar.gz", state)
-        stage = "private configuration copy"
-        for name in PRIVATE_BACKUP_FILES:
-            path = directory / "private" / name
-            if path.is_file():
-                private_file(destination / "private" / name, path.read_bytes())
-        for name in ["compose.json", "installation.json", "images.lock.json"]:
-            shutil.copy2(directory / name, destination / name)
-        (destination / "support").mkdir()
-        shutil.copy2(
-            directory / "support/nginx.conf", destination / "support/nginx.conf"
-        )
-        profile = json.loads((directory / "compose.json").read_text(encoding="utf-8"))
-        stage = "runtime image inspection"
-        images = {
-            profile["services"][name]["image"]: run(
-                [
-                    "docker",
-                    "image",
-                    "inspect",
-                    profile["services"][name]["image"],
-                    "--format",
-                    "{{.Id}}",
-                ],
-                capture=True,
-            ).strip()
-            for name in ["cosmic", "cards"]
-        }
-        stage = "runtime image archive"
-        run(
-            [
-                "docker",
-                "image",
-                "save",
-                "--output",
-                str(destination / "runtime-images.tar"),
-                *images,
-            ]
-        )
-        private_file(
-            destination / "runtime-images.json", json.dumps(images, indent=2) + "\n"
-        )
-        sums = {
-            p.relative_to(destination).as_posix(): file_hash(p)
-            for p in destination.rglob("*")
-            if p.is_file()
-        }
-        private_file(destination / "checksums.json", json.dumps(sums, indent=2) + "\n")
-        stage = "backup integrity validation"
-        validate_backup(destination)
-        success = True
-    except Exception as error:
-        failure = error
-    finally:
-        if restart or not success:
-            try:
-                start(directory, meta)
-            except Exception:
-                if success:
-                    raise RuntimeError(
-                        "Backup was created but service restart failed. Keep the private backup and inspect services: "
-                        + str(destination)
-                    ) from None
-                raise RuntimeError(
-                    "Backup failed during "
-                    + stage
-                    + " and service restart failed. Inspect services and retain the incomplete private backup: "
-                    + str(destination)
-                ) from None
-    if failure is not None:
-        code = getattr(failure, "code", None)
-        reason = (
-            " (" + code + ")"
-            if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,80}", code)
-            else ""
-        )
-        action = (
-            " Complete outstanding purchases before changing the installation."
-            if stage == "stopped pending-purchase check"
-            and isinstance(failure, RuntimeError)
-            and str(failure).startswith("Unresolved purchases")
-            else ""
-        )
-        raise RuntimeError(
-            "Backup failed during "
-            + stage
-            + reason
-            + "; previous services restarted."
-            + action
-            + " Incomplete private backup: "
-            + str(destination)
-        ) from None
-    print("Private backup: " + str(destination))
-    return destination
+def live_pending_guard_script():
+    return r"""
+import{DatabaseSync}from'node:sqlite';const db=new DatabaseSync('/opt/card/state/bridge.sqlite',{readOnly:true});
+try{
+ const version=db.prepare('PRAGMA user_version').get().user_version;
+ const discovery=db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='payment_discovery'").get();
+ if(![0,1,2].includes(version)||(version===2&&!discovery))throw Error('UNSUPPORTED_STATE');
+ const orders=db.prepare("SELECT COUNT(*) AS n FROM orders WHERE state NOT IN ('complete','rejected','refunded')").get().n;
+ console.log(orders+(discovery?db.prepare('SELECT COUNT(*) AS n FROM payment_discovery').get().n:0));
+}finally{db.close()}
+"""
 
 
-def file_hash(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def validate_backup(path):
-    path = Path(path).resolve()
-    if (path / "checksums.json").is_symlink() or (
-        path / "checksums.json"
-    ).stat().st_size > 65536:
-        raise RuntimeError("Backup checksum manifest is invalid.")
-    sums = json.loads((path / "checksums.json").read_text(encoding="utf-8"))
-    allowed = {
-        "database.sql",
-        "state.tar.gz",
-        "media.tar.gz",
-        "compose.json",
-        "installation.json",
-        "images.lock.json",
-        "runtime-images.tar",
-        "runtime-images.json",
-        "support/nginx.conf",
-        *("private/" + name for name in PRIVATE_BACKUP_FILES),
-    }
-    if (
-        not isinstance(sums, dict)
-        or len(sums) > len(allowed)
-        or not set(sums) <= allowed
-        or not {
-            "database.sql",
-            "state.tar.gz",
-            "compose.json",
-            "installation.json",
-            "images.lock.json",
-            "runtime-images.tar",
-            "runtime-images.json",
-            "support/nginx.conf",
-            "private/config.yaml",
-            "private/database.env",
-            "private/game.env",
-            "private/cards.env",
-            "private/catalog.json",
-        }
-        <= set(sums)
-    ):
-        raise RuntimeError("Unexpected or incomplete backup files.")
-    for name, expected in sums.items():
-        p = path / name
-        if (
-            not isinstance(expected, str)
-            or not re.fullmatch(r"[a-f0-9]{64}", expected)
-            or p.is_symlink()
-            or not p.resolve().is_relative_to(path)
-            or not p.is_file()
-            or file_hash(p) != expected
-        ):
-            raise RuntimeError("Backup integrity check failed.")
-    actual = {p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file()}
-    if actual != set(sums) | {"checksums.json"}:
-        raise RuntimeError("Unexpected backup files outside the checksum manifest.")
-    with tarfile.open(path / "state.tar.gz") as archive:
-        allowed_state = {
-            "framework.sqlite",
-            "framework.sqlite-wal",
-            "framework.sqlite-shm",
-            "bridge.sqlite",
-            "bridge.sqlite-wal",
-            "bridge.sqlite-shm",
-            "smoke-receipt.json",
-            "smoke-receipt.json.pending",
-        }
-        seen = set()
-        total = 0
-        for member in archive.getmembers():
-            name = member.name.removeprefix("./")
-            if member.isdir() and member.name in [".", "./"]:
-                continue
-            total += member.size
-            if (
-                not member.isfile()
-                or name not in allowed_state
-                or name in seen
-                or total > 256 * 1024 * 1024
-            ):
-                raise RuntimeError("Unexpected state archive member.")
-            seen.add(name)
-        if not {"framework.sqlite", "bridge.sqlite"} <= seen:
-            raise RuntimeError(
-                "State archive must contain framework.sqlite and bridge.sqlite."
+def state_schema_spec(version=2):
+    with closing(sqlite3.connect(":memory:")) as model:
+        model.executescript(normalized_schema_sql(version))
+        tables = [
+            row[0]
+            for row in model.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
             )
-    if (path / "media.tar.gz").exists():
-        validate_media_archive(path / "media.tar.gz")
-    validate_state_databases(path / "state.tar.gz")
-    return path
+        ]
+        result = {
+            name: [row[1] for row in model.execute("PRAGMA table_info(" + name + ")")]
+            for name in tables
+        }
+        result["indexes"] = [
+            row[0]
+            for row in model.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'framework_%' ORDER BY name"
+            )
+        ]
+        return result
 
 
 def normalized_schema_sql(version):
@@ -1393,8 +1154,469 @@ def validate_database_schema(con, framework):
                 validate_codec_header(row[1], version)
 
     else:
-        if version not in [0, 1] or not {"orders", "registrations"} <= tables:
+        if (
+            version not in [0, 1, 2]
+            or not {"orders", "registrations"} <= tables
+            or (version == 2 and "payment_discovery" not in tables)
+        ):
             raise RuntimeError("Backup bridge schema is unsupported or incomplete.")
+        if version == 2 and [
+            row[1] for row in con.execute("PRAGMA table_info(payment_discovery)")
+        ] != ["id", "source", "first_seen", "checked_at"]:
+            raise RuntimeError("Backup bridge schema is unsupported or incomplete.")
+
+
+def recovery_state_probe_script(require_legacy=False, require_normalized=False):
+    # Validate opaque headers on private copies; runtime startup authenticates the encrypted state.
+    schemas = json.dumps(
+        {version: normalized_schema_sql(version) for version in range(2, 9)},
+        separators=(",", ":"),
+    )
+    return (
+        r"""
+import{copyFileSync,lstatSync,mkdtempSync,rmSync}from'node:fs';
+import{join}from'node:path';import{tmpdir}from'node:os';import{DatabaseSync}from'node:sqlite';
+const schemas=SCHEMA_MODELS,legacy=REQUIRE_LEGACY,normalized=REQUIRE_NORMALIZED;let temporary,database;
+const entries=db=>db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all().filter(x=>x.name.startsWith('framework_')||x.tbl_name.startsWith('framework_')).map(x=>({...x,sql:x.sql?.replace(/\s+/g,' ').trim()}));
+function codecHeader(body,version){
+ const value=JSON.parse(body);
+ if(value?.encrypted===1){
+  const binary=(text,size)=>typeof text==='string'&&/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)&&Buffer.from(text,'base64').length===(size??Buffer.from(text,'base64').length)&&Buffer.from(text,'base64').length>0;
+  if(Object.keys(value).sort().join(',')!=='data,encrypted,iv,tag'||!binary(value.iv,12)||!binary(value.tag,16)||!binary(value.data))throw Error('INVALID_MARKER');
+ }else if(value?.format!=='digital-card.indexed-state'||value?.version!==version||value?.recordKeys!=='blind-v1'||Object.keys(value).sort().join(',')!=='format,recordKeys,version')throw Error('INVALID_MARKER');
+}
+function schema(db,framework){
+ const version=db.prepare('PRAGMA user_version').get().user_version;
+ const tables=new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(x=>x.name));
+ const columns=name=>db.prepare('PRAGMA table_info('+name+')').all().map(x=>x.name);
+ const same=(a,b)=>JSON.stringify([...a].sort())===JSON.stringify([...b].sort());
+ if(framework){
+  if(tables.has('framework_state')){
+   const row=db.prepare('SELECT schema_version,length(body) AS bytes FROM framework_state WHERE id=1').get();
+   if(![0,1].includes(version)||JSON.stringify(db.prepare('PRAGMA table_info(framework_state)').all().map(({name,type,pk})=>({name,type,pk})))!==JSON.stringify([{name:'id',type:'INTEGER',pk:1},{name:'schema_version',type:'INTEGER',pk:0},{name:'body',type:'TEXT',pk:0}])||entries(db).length!==1||!same(columns('framework_state'),['id','schema_version','body'])||!row||row.schema_version!==1||!row.bytes||[...tables].some(x=>x.startsWith('framework_')&&x!=='framework_state'))throw Error('INVALID_SCHEMA');
+  }else{
+   if(!Object.hasOwn(schemas,version)||db.prepare('PRAGMA foreign_key_check').get())throw Error('INVALID_SCHEMA');
+   const model=new DatabaseSync(':memory:');try{model.exec(schemas[version]);if(JSON.stringify(entries(db))!==JSON.stringify(entries(model)))throw Error('INVALID_SCHEMA')}finally{model.close()}
+   const row=db.prepare('SELECT schema_version,codec_check FROM framework_meta WHERE id=1').get();
+   if(!row||row.schema_version!==version||!row.codec_check)throw Error('INVALID_SCHEMA');
+   if(version>=3)codecHeader(row.codec_check,version);
+  }
+ }else if(![0,1,2].includes(version)||!tables.has('orders')||!tables.has('registrations')||(version===2&&(!tables.has('payment_discovery')||!same(columns('payment_discovery'),['id','source','first_seen','checked_at']))))throw Error('INVALID_SCHEMA');
+}
+try{
+ const source=process.argv[1]??'/opt/card/state';temporary=mkdtempSync(join(process.argv[2]??tmpdir(),'card-recovery-'));let bytes=0;
+ for(const file of ['framework.sqlite','bridge.sqlite'])for(const suffix of ['','-wal']){
+  const name=file+suffix;let info;try{info=lstatSync(join(source,name))}catch(error){if(suffix&&error.code==='ENOENT')continue;throw error}
+  if(!info.isFile()||(bytes+=info.size)>256*1024*1024)throw Error('INVALID_STATE');copyFileSync(join(source,name),join(temporary,name));
+ }
+ for(const file of ['framework.sqlite','bridge.sqlite']){
+  database=new DatabaseSync(join(temporary,file),{readOnly:true});
+  if(database.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw Error('INVALID_STATE');schema(database,file==='framework.sqlite');
+  if(normalized&&database.prepare('PRAGMA user_version').get().user_version!==(file==='framework.sqlite'?8:2))throw Error('NORMALIZED_STATE_REQUIRED');
+  if(legacy&&file==='framework.sqlite'&&!database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='framework_state'").get())throw Error('LEGACY_SOURCE_REQUIRED');
+  if(legacy&&file==='bridge.sqlite')for(const row of database.prepare("SELECT body FROM orders WHERE state NOT IN ('complete','rejected','refunded')").iterate())if(Object.hasOwn(JSON.parse(row.body),'financialVersion'))throw Error('LEGACY_SOURCE_REQUIRED');
+  database.close();database=null;
+ }
+ console.log(JSON.stringify({ok:true}));
+}catch{console.error(JSON.stringify({code:'RECOVERY_STATE_UNAVAILABLE'}));process.exitCode=1}
+finally{database?.close();if(temporary)rmSync(temporary,{recursive:true,force:true})}
+""".replace(
+            "SCHEMA_MODELS", schemas
+        )
+        .replace("REQUIRE_LEGACY", "true" if require_legacy else "false")
+        .replace("REQUIRE_NORMALIZED", "true" if require_normalized else "false")
+    )
+
+
+def service_image_id(directory, service):
+    profile = json.loads((directory / "compose.json").read_text(encoding="utf-8"))
+    # Compose can report a platform config digest that is not a runnable image ID.
+    return run(
+        ["docker", "image", "inspect", profile["services"][service]["image"],
+         "--format", "{{.Id}}"], capture=True
+    ).strip()
+
+
+def stopped_state_probe(directory, meta, script):
+    image = service_image_id(directory, "cards")
+    return run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=272m",
+            "--user",
+            "10002:10002",
+            "--mount",
+            "type=volume,source="
+            + meta["project"]
+            + "_card_state,target=/opt/card/state,readonly",
+            "--entrypoint",
+            "node",
+            image,
+            "--input-type=module",
+            "-e",
+            script,
+        ],
+        capture=True,
+        structured_error=True,
+    ).strip()
+
+
+def backup(directory, meta, restart=True, require_resolved=False, require_legacy=False):
+    if (directory / "migration.pending.json").exists() and restart:
+        raise RuntimeError(
+            "Migration ingress is fenced. Use backup --keep-stopped to preserve current data without reopening services."
+        )
+    if (directory / "migration.pending.json").exists() and json.loads(
+        (directory / "migration.pending.json").read_text(encoding="utf-8")
+    ).get("phase") == "staging":
+        raise RuntimeError(
+            "Complete the recorded migration staging before taking another backup. The original consistent migration backup is retained."
+        )
+    upgrade_marker = directory / "upgrade.pending.json"
+    if upgrade_marker.exists():
+        phase = json.loads(upgrade_marker.read_text(encoding="utf-8")).get("phase")
+        if restart or phase in ["staging", "rolling_back", "rollback_activating"]:
+            raise RuntimeError(
+                "Upgrade is fenced. Finish recorded staging/rollback first; only a staged candidate may use backup --keep-stopped."
+            )
+    if require_resolved and require_legacy:
+        raise ValueError(
+            "Legacy migration and resolved-only backup guards are mutually exclusive."
+        )
+    no_players(directory)
+    destination = (
+        directory
+        / "backups"
+        / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3))
+    )
+    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+    archive_media(directory, destination / "media.tar.gz")
+    image = service_image_id(directory, "cards")
+    success = False
+    restarted = False
+    stage = "writer shutdown"
+    failure = None
+    try:
+        compose(directory, "stop", "web", "cards", "cosmic")
+        stage = "stopped game-account check"
+        no_players(directory)
+        if require_legacy:
+            stage = "stopped legacy-migration check"
+            stopped_state_probe(
+                directory, meta, recovery_state_probe_script(require_legacy=True)
+            )
+        if require_resolved:
+            stage = "stopped pending-purchase check"
+            pending = run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=272m",
+                    "--user",
+                    "10002:10002",
+                    "--mount",
+                    "type=volume,source="
+                    + meta["project"]
+                    + "_card_state,target=/opt/card/state,readonly",
+                    "--entrypoint",
+                    "node",
+                    image,
+                    "--input-type=module",
+                    "-e",
+                    pending_guard_script(),
+                ],
+                capture=True,
+                structured_error=True,
+            ).strip()
+            if pending != "0":
+                raise RuntimeError(
+                    "Unresolved purchases remain at the stopped-writer boundary. Complete outstanding purchases before changing the installation."
+                )
+        stage = "game database dump"
+        sql = compose(
+            directory,
+            "exec",
+            "-T",
+            "db",
+            "sh",
+            "-c",
+            'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysqldump -u root --single-transaction --routines --events --triggers --hex-blob --databases cosmic --add-drop-database',
+            capture=True,
+        )
+        private_file(destination / "database.sql", sql)
+        stage = "card state archive"
+        state = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--user",
+                "10002:10002",
+                "--mount",
+                "type=volume,source="
+                + meta["project"]
+                + "_card_state,target=/state,readonly",
+                "--entrypoint",
+                "tar",
+                image,
+                "-C",
+                "/state",
+                "-czf",
+                "-",
+                ".",
+            ],
+            data=b"",
+            capture=True,
+        )
+        private_file(destination / "state.tar.gz", state)
+        stage = "private configuration copy"
+        for name in PRIVATE_BACKUP_FILES:
+            path = directory / "private" / name
+            if path.is_file():
+                private_file(destination / "private" / name, path.read_bytes())
+        for name in ["compose.json", "installation.json", "images.lock.json"]:
+            shutil.copy2(directory / name, destination / name)
+        for marker_name in ["migration.pending.json", "upgrade.pending.json"]:
+            marker_path = directory / marker_name
+            if marker_path.exists():
+                if marker_path.is_symlink():
+                    raise RuntimeError("Operation marker must not be a symbolic link.")
+                private_file(destination / marker_name, marker_path.read_bytes())
+        (destination / "support").mkdir()
+        shutil.copy2(
+            directory / "support/nginx.conf", destination / "support/nginx.conf"
+        )
+        profile = json.loads((directory / "compose.json").read_text(encoding="utf-8"))
+        stage = "runtime image inspection"
+        images = {
+            profile["services"][name]["image"]: run(
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    profile["services"][name]["image"],
+                    "--format",
+                    "{{.Id}}",
+                ],
+                capture=True,
+            ).strip()
+            for name in ["cosmic", "cards"]
+        }
+        stage = "runtime image archive"
+        run(
+            [
+                "docker",
+                "image",
+                "save",
+                "--output",
+                str(destination / "runtime-images.tar"),
+                *images,
+            ]
+        )
+        private_file(
+            destination / "runtime-images.json", json.dumps(images, indent=2) + "\n"
+        )
+        sums = {
+            p.relative_to(destination).as_posix(): file_hash(p)
+            for p in destination.rglob("*")
+            if p.is_file()
+        }
+        private_file(destination / "checksums.json", json.dumps(sums, indent=2) + "\n")
+        stage = "backup integrity validation"
+        validate_backup(destination)
+        success = True
+    except Exception as error:
+        failure = error
+    finally:
+        if (restart or not success) and not any(
+            (directory / name).exists()
+            for name in ["migration.pending.json", "upgrade.pending.json"]
+        ):
+            try:
+                start(directory, meta)
+                restarted = True
+            except Exception:
+                if success:
+                    raise RuntimeError(
+                        "Backup was created but service restart failed. Keep the private backup and inspect services: "
+                        + str(destination)
+                    ) from None
+                raise RuntimeError(
+                    "Backup failed during "
+                    + stage
+                    + " and service restart failed. Inspect services and retain the incomplete private backup: "
+                    + str(destination)
+                ) from None
+    if failure is not None:
+        code = getattr(failure, "code", None)
+        reason = (
+            " (" + code + ")"
+            if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,80}", code)
+            else ""
+        )
+        action = (
+            " Complete outstanding purchases before changing the installation."
+            if stage == "stopped pending-purchase check"
+            and isinstance(failure, RuntimeError)
+            and str(failure).startswith("Unresolved purchases")
+            else ""
+        )
+        raise RuntimeError(
+            "Backup failed during "
+            + stage
+            + reason
+            + (
+                "; previous services restarted."
+                if restarted
+                else "; services remain stopped behind the migration fence."
+            )
+            + action
+            + " Incomplete private backup: "
+            + str(destination)
+        ) from None
+    print("Private backup: " + str(destination))
+    return destination
+
+
+def file_hash(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def validate_backup(path):
+    path = Path(path).resolve()
+    if (path / "checksums.json").is_symlink() or (
+        path / "checksums.json"
+    ).stat().st_size > 65536:
+        raise RuntimeError("Backup checksum manifest is invalid.")
+    sums = json.loads((path / "checksums.json").read_text(encoding="utf-8"))
+    allowed = {
+        "database.sql",
+        "state.tar.gz",
+        "media.tar.gz",
+        "compose.json",
+        "installation.json",
+        "images.lock.json",
+        "runtime-images.tar",
+        "runtime-images.json",
+        "migration.pending.json",
+        "upgrade.pending.json",
+        "support/nginx.conf",
+        *("private/" + name for name in PRIVATE_BACKUP_FILES),
+    }
+    if (
+        not isinstance(sums, dict)
+        or len(sums) > len(allowed)
+        or not set(sums) <= allowed
+        or not {
+            "database.sql",
+            "state.tar.gz",
+            "compose.json",
+            "installation.json",
+            "images.lock.json",
+            "runtime-images.tar",
+            "runtime-images.json",
+            "support/nginx.conf",
+            "private/config.yaml",
+            "private/database.env",
+            "private/game.env",
+            "private/cards.env",
+            "private/catalog.json",
+        }
+        <= set(sums)
+    ):
+        raise RuntimeError("Unexpected or incomplete backup files.")
+    for name, expected in sums.items():
+        p = path / name
+        if (
+            not isinstance(expected, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", expected)
+            or p.is_symlink()
+            or not p.resolve().is_relative_to(path)
+            or not p.is_file()
+            or file_hash(p) != expected
+        ):
+            raise RuntimeError("Backup integrity check failed.")
+    actual = {p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file()}
+    if actual != set(sums) | {"checksums.json"}:
+        raise RuntimeError("Unexpected backup files outside the checksum manifest.")
+    with tarfile.open(path / "state.tar.gz") as archive:
+        allowed_state = {
+            "framework.sqlite",
+            "framework.sqlite-wal",
+            "framework.sqlite-shm",
+            "bridge.sqlite",
+            "bridge.sqlite-wal",
+            "bridge.sqlite-shm",
+            "smoke-receipt.json",
+            "smoke-receipt.json.pending",
+        }
+        seen = set()
+        total = 0
+        for member in archive.getmembers():
+            name = member.name.removeprefix("./")
+            if member.isdir() and member.name in [".", "./"]:
+                continue
+            total += member.size
+            if (
+                not member.isfile()
+                or name not in allowed_state
+                or name in seen
+                or total > 256 * 1024 * 1024
+            ):
+                raise RuntimeError("Unexpected state archive member.")
+            seen.add(name)
+        if not {"framework.sqlite", "bridge.sqlite"} <= seen:
+            raise RuntimeError(
+                "State archive must contain framework.sqlite and bridge.sqlite."
+            )
+    if (path / "media.tar.gz").exists():
+        validate_media_archive(path / "media.tar.gz")
+    validate_state_databases(path / "state.tar.gz")
+    for marker_name in ["migration.pending.json", "upgrade.pending.json"]:
+        if not (path / marker_name).exists():
+            continue
+        marker_path = path / marker_name
+        if marker_path.stat().st_size > 65536:
+            raise RuntimeError("Backup migration marker is invalid.")
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        profile = json.loads((path / "compose.json").read_text(encoding="utf-8"))
+        staged = json.loads(json.dumps(marker.get("candidate", {})))
+        if (
+            not isinstance(staged.get("services"), dict)
+            or "network" not in staged["services"]
+        ):
+            raise RuntimeError("Backup migration marker is invalid.")
+        staged["services"]["network"]["ports"] = []
+        if (
+            marker.get("format") != 1
+            or marker.get("phase") not in ["migrating", "validating", "activating"]
+            or marker.get("meta")
+            != json.loads((path / "installation.json").read_text(encoding="utf-8"))
+            or marker.get("binding") != migration_binding(path)
+            or marker.get("runtimeImages")
+            != json.loads((path / "runtime-images.json").read_text(encoding="utf-8"))
+            or not (
+                profile == staged
+                or marker.get("phase") == "activating"
+                and profile == marker.get("candidate")
+            )
+        ):
+            raise RuntimeError("Backup migration marker is invalid.")
+    return path
 
 
 def validate_state_databases(path):
@@ -1413,21 +1635,11 @@ def validate_state_databases(path):
                     ) as outgoing:
                         shutil.copyfileobj(incoming, outgoing)
                     (root / name).chmod(0o600)
-        for name, required in [
-            ("framework.sqlite", set()),
-            ("bridge.sqlite", {"orders", "registrations"}),
-        ]:
+        for name in ["framework.sqlite", "bridge.sqlite"]:
             try:
                 con = sqlite3.connect((root / name).as_uri() + "?mode=ro", uri=True)
                 try:
-                    if con.execute("PRAGMA quick_check").fetchone()[
-                        0
-                    ] != "ok" or not required <= {
-                        row[0]
-                        for row in con.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table'"
-                        )
-                    }:
+                    if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                         raise RuntimeError(
                             "Backup SQLite integrity or schema check failed."
                         )
@@ -1487,6 +1699,13 @@ def verify_backup_runtime_images(source):
 
 def recover_empty(directory, source, expected_project, relocate=False, retry=False):
     source = validate_backup(source)
+    if any(
+        (source / name).exists()
+        for name in ["migration.pending.json", "upgrade.pending.json"]
+    ):
+        raise RuntimeError(
+            "This backup contains unfinished migration state. Automatic recovery cannot discard its ingress fence. Preserve the marker, current data and original migration backup for qualified recovery."
+        )
     saved = backup_identity(source)
     if saved["project"] != expected_project:
         raise RuntimeError("Backup belongs to a different installation project.")
@@ -1650,66 +1869,6 @@ def recover_empty(directory, source, expected_project, relocate=False, retry=Fal
     )
 
 
-def recovery_state_probe_script():
-    # Validate opaque headers on private copies; runtime startup authenticates the encrypted state.
-    schemas = json.dumps(
-        {version: normalized_schema_sql(version) for version in range(2, 9)},
-        separators=(",", ":"),
-    )
-    return (
-        r"""
-import{copyFileSync,lstatSync,mkdtempSync,rmSync}from'node:fs';
-import{join}from'node:path';import{tmpdir}from'node:os';import{DatabaseSync}from'node:sqlite';
-const schemas=SCHEMA_MODELS;let temporary,database,code='RECOVERY_COPY_UNAVAILABLE';
-const entries=db=>db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all().filter(x=>x.name.startsWith('framework_')||x.tbl_name.startsWith('framework_')).map(x=>({...x,sql:x.sql?.replace(/\s+/g,' ').trim()}));
-function codecHeader(body,version){
- const value=JSON.parse(body);
- if(value?.encrypted===1){
-  const binary=(text,size)=>typeof text==='string'&&/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)&&Buffer.from(text,'base64').length===(size??Buffer.from(text,'base64').length)&&Buffer.from(text,'base64').length>0;
-  if(Object.keys(value).sort().join(',')!=='data,encrypted,iv,tag'||!binary(value.iv,12)||!binary(value.tag,16)||!binary(value.data))throw Error('INVALID_MARKER');
- }else if(value?.format!=='digital-card.indexed-state'||value?.version!==version||value?.recordKeys!=='blind-v1'||Object.keys(value).sort().join(',')!=='format,recordKeys,version')throw Error('INVALID_MARKER');
-}
-function schema(db,framework){
- const version=db.prepare('PRAGMA user_version').get().user_version;
- const tables=new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(x=>x.name));
- const columns=name=>db.prepare('PRAGMA table_info('+name+')').all().map(x=>x.name);
- const same=(a,b)=>JSON.stringify([...a].sort())===JSON.stringify([...b].sort());
- if(framework){
-  if(tables.has('framework_state')){
-   const row=db.prepare('SELECT schema_version,length(body) AS bytes FROM framework_state WHERE id=1').get();
-   if(![0,1].includes(version)||JSON.stringify(db.prepare('PRAGMA table_info(framework_state)').all().map(({name,type,pk})=>({name,type,pk})))!==JSON.stringify([{name:'id',type:'INTEGER',pk:1},{name:'schema_version',type:'INTEGER',pk:0},{name:'body',type:'TEXT',pk:0}])||entries(db).length!==1||!same(columns('framework_state'),['id','schema_version','body'])||!row||row.schema_version!==1||!row.bytes||[...tables].some(x=>x.startsWith('framework_')&&x!=='framework_state'))throw Error('INVALID_SCHEMA');
-  }else{
-   if(!Object.hasOwn(schemas,version)||db.prepare('PRAGMA foreign_key_check').get())throw Error('INVALID_SCHEMA');
-   const model=new DatabaseSync(':memory:');try{model.exec(schemas[version]);if(JSON.stringify(entries(db))!==JSON.stringify(entries(model)))throw Error('INVALID_SCHEMA')}finally{model.close()}
-   const row=db.prepare('SELECT schema_version,codec_check FROM framework_meta WHERE id=1').get();
-   if(!row||row.schema_version!==version||!row.codec_check)throw Error('INVALID_SCHEMA');
-   if(version>=3)codecHeader(row.codec_check,version);
-  }
- }else if(![0,1].includes(version)||!tables.has('orders')||!tables.has('registrations'))throw Error('INVALID_SCHEMA');
-}
-try{
- const source=process.argv[1]??'/opt/card/state';temporary=mkdtempSync(join(process.argv[2]??tmpdir(),'card-recovery-'));let bytes=0;
- for(const file of ['framework.sqlite','bridge.sqlite'])for(const suffix of ['','-wal']){
-  const name=file+suffix;let info;try{info=lstatSync(join(source,name))}catch(error){if(suffix&&error.code==='ENOENT')continue;throw error}
-  if(!info.isFile()||(bytes+=info.size)>256*1024*1024)throw Error('INVALID_STATE');copyFileSync(join(source,name),join(temporary,name));
- }
- for(const file of ['framework.sqlite','bridge.sqlite']){
-  code=file==='framework.sqlite'?'RECOVERY_FRAMEWORK_UNAVAILABLE':'RECOVERY_BRIDGE_UNAVAILABLE';
-  database=new DatabaseSync(join(temporary,file),{readOnly:true});
-  if(database.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw Error('INVALID_STATE');schema(database,file==='framework.sqlite');
-  database.close();database=null;
- }
- console.log(JSON.stringify({ok:true}));
-}catch{console.error(JSON.stringify({code}));process.exitCode=1}
-finally{database?.close();if(temporary)rmSync(temporary,{recursive:true,force:true})}
-""".replace(
-            "SCHEMA_MODELS", schemas
-        )
-        .replace("REQUIRE_LEGACY", "false")
-        .replace("REQUIRE_NORMALIZED", "false")
-    )
-
-
 def resume_recovery_activation(directory, meta, source, locks):
     # This phase can include post-backup transactions. Do not import or copy any data.
     verify_backup_runtime_images(source)
@@ -1786,7 +1945,9 @@ def resume_recovery_activation(directory, meta, source, locks):
     )
 
 
-def restore_data(directory, meta, source, restore_configuration=True):
+def restore_data(
+    directory, meta, source, restore_configuration=True, *, allow_upgrade=False
+):
     compose(directory, "stop", "web", "cards", "cosmic")
     # Database credentials do not change during restore; backups belong to this installation.
     if (directory / "private/database.env").read_bytes() != (
@@ -1869,7 +2030,7 @@ def restore_data(directory, meta, source, restore_configuration=True):
             meta, json.loads((source / "images.lock.json").read_text(encoding="utf-8"))
         )
     )
-    activate_configuration(directory, meta, profile)
+    activate_configuration(directory, meta, profile, allow_upgrade=allow_upgrade)
 
 
 def recreate_namespace(directory):
@@ -1878,7 +2039,7 @@ def recreate_namespace(directory):
     compose(directory, "rm", "-f", "web", "cards", "cosmic", "network")
 
 
-def activate_configuration(directory, meta, profile):
+def activate_configuration(directory, meta, profile, *, allow_upgrade=False):
     staged = json.loads(json.dumps(profile))
     staged["services"]["network"]["ports"] = []
     private_file(directory / "compose.json", json.dumps(staged, indent=2) + "\n")
@@ -1900,15 +2061,20 @@ def activate_configuration(directory, meta, profile):
             + "\n",
         )
     recreate_namespace(directory)
-    start(directory, meta, allow_recovery=True)
+    start(directory, meta, allow_recovery=True, allow_upgrade=allow_upgrade)
     if recovery_marker.exists():
         private_file(
             recovery_marker, json.dumps({**recovery, "phase": "activating"}) + "\n"
         )
+    if allow_upgrade:
+        marker = json.loads(
+            (directory / "upgrade.pending.json").read_text(encoding="utf-8")
+        )
+        write_migration(directory, marker, "rollback_activating")
     private_file(directory / "compose.json", json.dumps(profile, indent=2) + "\n")
     try:
         recreate_namespace(directory)
-        start(directory, meta, allow_recovery=True)
+        start(directory, meta, allow_recovery=True, allow_upgrade=allow_upgrade)
     except Exception as error:
         try:
             compose(directory, "stop", "web", "cards", "cosmic")
@@ -1922,7 +2088,21 @@ def activate_configuration(directory, meta, profile):
 
 
 def restore(directory, meta, source):
+    if any(
+        (directory / name).exists()
+        for name in ["migration.pending.json", "upgrade.pending.json"]
+    ):
+        raise RuntimeError(
+            "Upgrade/migration data must be preserved. Finish the recorded migration; do not restore an older backup over new payment identities."
+        )
     source = validate_backup(source)
+    if any(
+        (source / name).exists()
+        for name in ["migration.pending.json", "upgrade.pending.json"]
+    ):
+        raise RuntimeError(
+            "Automatic restore cannot discard an unfinished migration fence. Preserve the current-state archive, marker and original migration backup."
+        )
     saved = backup_identity(source)
     if saved["directory"] != str(directory) or saved["project"] != meta["project"]:
         raise RuntimeError("Restore this backup to its original installation only.")
@@ -1945,22 +2125,563 @@ def restore(directory, meta, source):
     print("Backup restored and connection verified.")
 
 
-def upgrade(directory, meta):
+def migration_candidate_probe_script():
+    return r"""
+import{mkdtempSync,rmSync,accessSync}from'node:fs';import{join}from'node:path';
+import{tmpdir}from'node:os';import{DatabaseSync}from'node:sqlite';import{CardFramework}from'@digital-card/framework';
+import{SQLiteStore}from'@digital-card/framework/sqlite';import{Journal}from'./src/journal.mjs';
+let root,store,journal,db;
+try{
+ for(const method of ['prepareExternalPurchase','commitExternalPurchase','cancelExternalPurchase','confirmExternalCompensation','pendingExternalPurchases','resolveLegacyExternalPurchase','backfillCompletionReservations'])if(typeof CardFramework.prototype[method]!=='function')throw Error('MISSING_RECOVERY_API');
+ accessSync('./tools/payments.mjs');root=mkdtempSync(join(tmpdir(),'card-candidate-'));
+ store=new SQLiteStore(join(root,'framework.sqlite'),{encryptionKey:Buffer.alloc(32,7)});
+ db=new DatabaseSync(join(root,'framework.sqlite'),{readOnly:true});
+ if(db.prepare('PRAGMA user_version').get().user_version!==8||!db.prepare("SELECT 1 FROM sqlite_master WHERE name='framework_meta'").get()||db.prepare("SELECT 1 FROM sqlite_master WHERE name='framework_state'").get())throw Error('UNSUPPORTED_RECOVERY_RUNTIME');db.close();db=null;
+ const authenticated=new SQLiteStore(join(root,'framework.sqlite'),{encryptionKey:Buffer.alloc(32,7),readOnly:true});try{if(authenticated.diagnostics().storageSchema!==8)throw Error('UNSUPPORTED_RECOVERY_RUNTIME')}finally{authenticated.close()}
+ journal=new Journal(join(root,'bridge.sqlite'));
+ if(journal.db.prepare('PRAGMA user_version').get().user_version!==2||!journal.db.prepare("SELECT 1 FROM sqlite_master WHERE name='payment_discovery'").get())throw Error('UNSUPPORTED_RECOVERY_RUNTIME');
+ console.log(JSON.stringify({ok:true,frameworkSchema:8,bridgeSchema:2}));
+}catch{console.error(JSON.stringify({code:'MIGRATION_CANDIDATE_UNSUPPORTED'}));process.exitCode=1}
+finally{db?.close();journal?.close();store?.close();if(root)rmSync(root,{recursive:true,force:true})}
+"""
+
+
+def migration_closure_probe_script():
+    return r"""
+import{copyFileSync,lstatSync,mkdtempSync,rmSync}from'node:fs';import{join}from'node:path';
+import{DatabaseSync}from'node:sqlite';import{CardFramework}from'@digital-card/framework';
+import{SQLiteStore}from'@digital-card/framework/sqlite';import{PaymentAuthority,paymentProviderId,paymentActor}from'./src/payment-authority.mjs';import{createGameClient}from'./src/protocol.mjs';
+let root,store,core,db;
+try{
+ root=mkdtempSync('/tmp/card-closure-');let bytes=0;
+ for(const file of ['framework.sqlite','bridge.sqlite'])for(const suffix of ['','-wal']){
+  const name=file+suffix;let stat;try{stat=lstatSync('/opt/card/state/'+name)}catch(error){if(suffix&&error.code==='ENOENT')continue;throw error}
+  if(!stat.isFile()||(bytes+=stat.size)>256*1024*1024)throw Error('INVALID_STATE');copyFileSync('/opt/card/state/'+name,join(root,name));
+ }
+ const key=Buffer.from(process.env.STATE_KEY??'','base64');if(key.length!==32)throw Error('INVALID_KEY');
+ store=new SQLiteStore(join(root,'framework.sqlite'),{encryptionKey:key,readOnly:true});
+ if(store.diagnostics().storageSchema!==8)throw Error('INVALID_SCHEMA');
+ core=new CardFramework({store,externalPurchaseProviders:{[paymentProviderId]:new PaymentAuthority()}});
+ const pending=core.pendingExternalPurchases(paymentActor,{providerId:paymentProviderId,after:null,limit:1});
+ if(!Array.isArray(pending.items)||pending.items.length>1||pending.nextCursor!==null&&typeof pending.nextCursor!=='string')throw Error('INVALID_PAGE');
+ db=new DatabaseSync(join(root,'bridge.sqlite'),{readOnly:true});
+ if(db.prepare('PRAGMA user_version').get().user_version!==2||db.prepare('PRAGMA quick_check').get().quick_check!=='ok')throw Error('INVALID_SCHEMA');
+ const journal=db.prepare("SELECT COUNT(*) AS n FROM orders WHERE state NOT IN ('complete','rejected','refunded')").get().n;
+ const orphans=db.prepare('SELECT COUNT(*) AS n FROM payment_discovery').get().n;
+ const game=createGameClient({url:process.env.GAME_URL,secret:process.env.GAME_SHARED_KEY});
+ // The authenticated pending route requires the native lease without calling stopped card writers.
+ const native=await game('/payment/pending',{after:null,limit:1});
+ if(!Array.isArray(native.items)||native.items.length>1||native.nextCursor!==null&&typeof native.nextCursor!=='string')throw Error('INVALID_PAGE');
+ const clear=journal===0&&orphans===0&&pending.items.length===0&&pending.nextCursor===null&&native.items.length===0&&native.nextCursor===null;
+ console.log(JSON.stringify({ok:true,clear,journal,orphans,frameworkPending:pending.items.length>0,nativePending:native.items.length>0}));
+}catch(error){const code=/^[A-Z][A-Z0-9_]{0,80}$/.test(error.code??'')?error.code:'MIGRATION_CLOSURE_UNAVAILABLE';console.error(JSON.stringify({code}));process.exitCode=1}
+finally{db?.close();if(core)core.close();else store?.close();if(root)rmSync(root,{recursive:true,force:true})}
+"""
+
+
+def migration_binding(directory):
+    names = [
+        "installation.json",
+        "images.lock.json",
+        *[
+            "private/" + name
+            for name in [
+                "cards.env",
+                "game.env",
+                "database.env",
+                "config.yaml",
+                "catalog.json",
+            ]
+        ],
+    ]
+    return {name: file_hash(directory / name) for name in names}
+
+
+def atomic_migration_file(path, data):
+    if path.is_symlink():
+        raise RuntimeError("Migration paths must not be symbolic links.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=path.name + ".migration-", dir=path.parent
+    )
+    temporary = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data.encode() if isinstance(data, str) else data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if os.name == "posix":
+            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def migration_staging_bytes(marker, safety):
+    if set(marker["oldBinding"]) != set(migration_binding(safety)):
+        raise RuntimeError("Recorded configuration binding paths differ.")
+    values = {name: (safety / name).read_bytes() for name in marker["oldBinding"]}
+    values["installation.json"] = (json.dumps(marker["meta"], indent=2) + "\n").encode()
+    values["images.lock.json"] = (
+        json.dumps(marker["candidateLocks"], indent=2) + "\n"
+    ).encode()
+    cards = values["private/cards.env"].decode("utf-8")
+    settings = {
+        line.split("=", 1)[0]
+        for line in cards.splitlines()
+        if line and not line.startswith("#") and "=" in line
+    }
+    if "ENABLE_SERIES_ONE_REWARDS" not in settings:
+        cards = (
+            cards.rstrip()
+            + "\nENABLE_SERIES_ONE_REWARDS="
+            + ("1" if marker["meta"]["seriesOneEnabled"] else "0")
+            + "\n"
+        )
+    if "ASSET_ROOT" not in settings:
+        cards = cards.rstrip() + "\nASSET_ROOT=/assets\n"
+    values["private/cards.env"] = cards.encode()
+    return values
+
+
+def stage_legacy_migration(directory, marker, safety):
+    expected_old = {name: file_hash(safety / name) for name in marker["oldBinding"]}
+    values = migration_staging_bytes(marker, safety)
+    expected_new = {
+        name: hashlib.sha256(value).hexdigest() for name, value in values.items()
+    }
+    if marker["oldBinding"] != expected_old or marker["newBinding"] != expected_new:
+        raise RuntimeError(
+            "Migration staging identity differs from its verified backup."
+        )
+    for name in expected_old:
+        path = directory / name
+        if path.is_symlink() or file_hash(path) not in [
+            expected_old[name],
+            expected_new[name],
+        ]:
+            raise RuntimeError(
+                "Migration staging keys or configuration differ from recorded old/new identities."
+            )
+    profile = json.loads((directory / "compose.json").read_text(encoding="utf-8"))
+    staged = json.loads(json.dumps(marker["candidate"]))
+    staged["services"]["network"]["ports"] = []
+    original_profile = json.loads((safety / "compose.json").read_text(encoding="utf-8"))
+    if profile not in [original_profile, staged]:
+        raise RuntimeError(
+            "Migration staging ingress differs from the recorded profiles."
+        )
+    atomic_migration_file(
+        directory / "compose.json", json.dumps(staged, indent=2) + "\n"
+    )
+    for name, value in values.items():
+        if file_hash(directory / name) != expected_new[name]:
+            atomic_migration_file(directory / name, value)
+    marker = {**marker, "phase": "migrating", "binding": migration_binding(directory)}
+    return write_migration(directory, marker)
+
+
+def migration_images(profile):
+    return {
+        profile["services"][service]["image"]: run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                profile["services"][service]["image"],
+                "--format",
+                "{{.Id}}",
+            ],
+            capture=True,
+        ).strip()
+        for service in ["cosmic", "cards"]
+    }
+
+
+def write_migration(directory, marker, phase=None):
+    if phase is not None:
+        marker = {
+            **marker,
+            "phase": (
+                marker["phase"]
+                if marker["phase"] in ["activating", "rollback_activating"]
+                else phase
+            ),
+        }
+    atomic_migration_file(
+        directory
+        / (
+            "upgrade.pending.json"
+            if marker.get("kind") == "upgrade"
+            else "migration.pending.json"
+        ),
+        json.dumps(marker, indent=2) + "\n",
+    )
+    return marker
+
+
+def payment_closure(directory, meta, profile):
+    namespace = compose(directory, "ps", "-q", "network", capture=True).strip()
+    return json.loads(
+        run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "container:" + namespace,
+                "--read-only",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=272m",
+                "--user",
+                "10002:10002",
+                "--env-file",
+                str(directory / "private/cards.env"),
+                "--mount",
+                "type=volume,source="
+                + meta["project"]
+                + "_card_state,target=/opt/card/state,readonly",
+                "--entrypoint",
+                "node",
+                profile["services"]["cards"]["image"],
+                "--input-type=module",
+                "-e",
+                migration_closure_probe_script(),
+            ],
+            capture=True,
+            structured_error=True,
+        )
+    )
+
+
+def finish_legacy_migration(directory, meta):
+    path = directory / "migration.pending.json"
+    if not path.is_file():
+        raise RuntimeError("No recorded legacy migration exists for this installation.")
+    marker = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        marker.get("format") != 1
+        or marker.get("phase")
+        not in ["staging", "migrating", "validating", "activating"]
+        or meta not in [marker.get("meta"), marker.get("oldMeta")]
+    ):
+        raise RuntimeError(
+            "The recorded migration identity, keys or configuration differ. Preserve current data and the original marker."
+        )
+    safety = validate_backup(marker["backup"])
+    original = backup_identity(safety)
+    if (
+        file_hash(safety / "checksums.json") != marker["backupDigest"]
+        or original["project"] != meta["project"]
+        or original["directory"] != str(directory)
+    ):
+        raise RuntimeError("The recorded migration backup identity differs.")
+    if marker["phase"] == "staging":
+        if (
+            marker.get("oldMeta") != original
+            or create_compose(marker["meta"], marker["candidateLocks"])
+            != marker["candidate"]
+            or migration_images(marker["candidate"]) != marker["runtimeImages"]
+        ):
+            raise RuntimeError("The recorded staging source or runtime differs.")
+        no_players(directory)
+        marker = stage_legacy_migration(directory, marker, safety)
+        meta = marker["meta"]
+    if marker.get("meta") != meta or marker.get("binding") != migration_binding(
+        directory
+    ):
+        raise RuntimeError(
+            "The recorded migration keys or configuration differ. Preserve current data and the marker."
+        )
+    profile = create_compose(
+        meta, json.loads((directory / "images.lock.json").read_text(encoding="utf-8"))
+    )
+    if (
+        profile != marker["candidate"]
+        or migration_images(profile) != marker["runtimeImages"]
+    ):
+        raise RuntimeError("The recorded migration runtime identity differs.")
+    previous = json.loads((directory / "compose.json").read_text(encoding="utf-8"))
+    staged = json.loads(json.dumps(profile))
+    staged["services"]["network"]["ports"] = []
+    if previous != staged and not (
+        marker["phase"] == "activating" and previous == profile
+    ):
+        raise RuntimeError(
+            "The migration ingress configuration differs from its recorded phase."
+        )
     no_players(directory)
-    pending = compose(
-        directory,
-        "exec",
-        "-T",
-        "cards",
-        "node",
-        "--input-type=module",
-        "-e",
-        "import{DatabaseSync}from'node:sqlite';let d=new DatabaseSync('/opt/card/state/bridge.sqlite',{readOnly:true});console.log(d.prepare(\"SELECT COUNT(*) AS n FROM orders WHERE state NOT IN ('complete','rejected')\").get().n);d.close()",
-        capture=True,
-    ).strip()
+    marker = write_migration(directory, marker, "validating")
+    atomic_migration_file(
+        directory / "compose.json", json.dumps(staged, indent=2) + "\n"
+    )
+    try:
+        recreate_namespace(directory)
+        compose(
+            directory, "up", "-d", "--no-build", "--wait", "db", "network", "cosmic"
+        )
+        compose(directory, "up", "-d", "--no-build", "cards")
+        # Allow the existing state migration to finish; never reopen ingress for diagnostics.
+        ready = False
+        for attempt in range(30):
+            try:
+                stopped_state_probe(
+                    directory,
+                    meta,
+                    recovery_state_probe_script(require_normalized=True),
+                )
+                ready = True
+                break
+            except Exception:
+                if attempt < 29:
+                    time.sleep(2)
+        if not ready:
+            raise RuntimeError("Migration state did not become available")
+        compose(directory, "stop", "web", "cards")
+        report = payment_closure(directory, meta, profile)
+        if report.get("ok") is not True or report.get("clear") is not True:
+            raise RuntimeError(
+                "Original payment proof or reconciliation remains pending"
+            )
+        start(directory, meta, allow_migration=True)
+        if stopped_state_probe_after_stop(directory, meta) != "0":
+            raise RuntimeError(
+                "New unresolved payment work appeared during private validation"
+            )
+        report = payment_closure(directory, meta, profile)
+        if report.get("ok") is not True or report.get("clear") is not True:
+            raise RuntimeError(
+                "Native or framework payment closure changed during private validation"
+            )
+        marker = write_migration(directory, marker, "activating")
+        atomic_migration_file(
+            directory / "compose.json", json.dumps(profile, indent=2) + "\n"
+        )
+        recreate_namespace(directory)
+        start(directory, meta, allow_migration=True)
+        path.unlink()
+    except Exception as error:
+        try:
+            compose(
+                directory,
+                "stop",
+                "web",
+                "cards",
+                *(["cosmic"] if marker["phase"] == "activating" else [])
+            )
+        except Exception:
+            raise RuntimeError(
+                "Migration qualification and bridge shutdown failed. Preserve current data and marker; inspect services before retrying."
+            ) from None
+        if marker["phase"] != "activating":
+            atomic_migration_file(
+                directory / "compose.json", json.dumps(staged, indent=2) + "\n"
+            )
+        code = getattr(error, "code", None)
+        reason = (
+            " (" + code + ")"
+            if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,80}", code)
+            else ""
+        )
+        raise RuntimeError(
+            "Legacy migration remains closed or stopped; current databases, identities and marker were preserved. Resolve only proven obligations, then repeat upgrade --finish-legacy-migration. No backup was restored."
+            + reason
+        ) from None
+    print(
+        "Legacy migration completed; payment closure verified and original keys/catalog retained."
+    )
+
+
+def finish_ordinary_upgrade(directory, meta):
+    path = directory / "upgrade.pending.json"
+    if not path.is_file():
+        raise RuntimeError("No recorded ordinary upgrade exists for this installation.")
+    marker = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        marker.get("format") != 1
+        or marker.get("kind") != "upgrade"
+        or marker.get("phase")
+        not in [
+            "staging",
+            "migrating",
+            "validating",
+            "activating",
+            "rolling_back",
+            "rollback_activating",
+        ]
+        or meta not in [marker.get("meta"), marker.get("oldMeta")]
+    ):
+        raise RuntimeError(
+            "Recorded upgrade identity differs; preserve current data and marker."
+        )
+    safety = validate_backup(marker["backup"])
+    original = backup_identity(safety)
+    if (
+        original != marker.get("oldMeta")
+        or original["project"] != meta["project"]
+        or original["directory"] != str(directory)
+        or file_hash(safety / "checksums.json") != marker["backupDigest"]
+    ):
+        raise RuntimeError("Recorded upgrade safety backup identity differs.")
+    values = migration_staging_bytes(marker, safety)
+    expected_old = {name: file_hash(safety / name) for name in marker["oldBinding"]}
+    expected_new = {
+        name: hashlib.sha256(value).hexdigest() for name, value in values.items()
+    }
+    if marker["oldBinding"] != expected_old or marker["newBinding"] != expected_new:
+        raise RuntimeError("Recorded upgrade configuration plan differs.")
+    if (
+        create_compose(marker["meta"], marker["candidateLocks"]) != marker["candidate"]
+        or migration_images(marker["candidate"]) != marker["runtimeImages"]
+    ):
+        raise RuntimeError("Recorded upgrade runtime identity differs.")
+    no_players(directory)
+    if marker["phase"] in ["rolling_back", "rollback_activating"]:
+        for name in expected_old:
+            current = directory / name
+            if current.is_symlink() or file_hash(current) not in [
+                expected_old[name],
+                expected_new[name],
+            ]:
+                raise RuntimeError(
+                    "Recorded rollback configuration differs; preserve the marker."
+                )
+        original_profile = json.loads(
+            (safety / "compose.json").read_text(encoding="utf-8")
+        )
+        original_closed = json.loads(json.dumps(original_profile))
+        original_closed["services"]["network"]["ports"] = []
+        candidate_closed = json.loads(json.dumps(marker["candidate"]))
+        candidate_closed["services"]["network"]["ports"] = []
+        current_profile = json.loads(
+            (directory / "compose.json").read_text(encoding="utf-8")
+        )
+        allowed_profiles = (
+            [original_profile, original_closed]
+            if marker["phase"] == "rollback_activating"
+            else [original_profile, original_closed, candidate_closed]
+        )
+        if current_profile not in allowed_profiles:
+            raise RuntimeError(
+                "Recorded rollback ingress differs; no backup was imported."
+            )
+        if marker["phase"] == "rollback_activating":
+            if migration_binding(directory) != expected_old:
+                raise RuntimeError(
+                    "Rollback activation identity differs; no backup was imported."
+                )
+            activate_configuration(
+                directory, original, original_profile, allow_upgrade=True
+            )
+        else:
+            restore_data(directory, original, safety, allow_upgrade=True)
+        path.unlink()
+        print(
+            "Upgrade rollback completed; previous runtime and consistent data restored."
+        )
+        return
+    if marker["phase"] == "staging":
+        marker = stage_legacy_migration(directory, marker, safety)
+    meta = marker["meta"]
+    if migration_binding(directory) != marker.get("binding"):
+        raise RuntimeError(
+            "Recorded upgrade keys/configuration differ; preserve current data."
+        )
+    profile = marker["candidate"]
+    staged = json.loads(json.dumps(profile))
+    staged["services"]["network"]["ports"] = []
+    current = json.loads((directory / "compose.json").read_text(encoding="utf-8"))
+    if current != staged and not (
+        marker["phase"] == "activating" and current == profile
+    ):
+        raise RuntimeError("Upgrade ingress differs from its recorded phase.")
+    try:
+        marker = write_migration(directory, marker, "validating")
+        private_file(directory / "compose.json", json.dumps(staged, indent=2) + "\n")
+        recreate_namespace(directory)
+        start(directory, meta, allow_upgrade=True)
+        if stopped_state_probe_after_stop(directory, meta) != "0":
+            raise RuntimeError(
+                "Unresolved payment work appeared during private validation"
+            )
+        closure = payment_closure(directory, meta, profile)
+        if closure.get("ok") is not True or closure.get("clear") is not True:
+            raise RuntimeError("Native or framework payment obligations remain")
+        marker = write_migration(directory, marker, "activating")
+        private_file(directory / "compose.json", json.dumps(profile, indent=2) + "\n")
+        recreate_namespace(directory)
+        start(directory, meta, allow_upgrade=True)
+        path.unlink()
+    except Exception as error:
+        # The durable phase, not an in-memory assumption, decides whether imports remain safe.
+        marker = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            compose(directory, "stop", "web", "cards", "cosmic")
+        except Exception:
+            raise RuntimeError(
+                "Upgrade shutdown failed; preserve current data and use upgrade --finish-upgrade after inspecting services."
+            ) from None
+        if marker["phase"] != "activating":
+            marker = write_migration(directory, marker, "rolling_back")
+            try:
+                restore_data(directory, original, safety, allow_upgrade=True)
+                path.unlink()
+            except Exception:
+                raise RuntimeError(
+                    "Upgrade rollback remains incomplete. Keep the marker and repeat upgrade --finish-upgrade; ordinary start is blocked."
+                ) from None
+            raise RuntimeError(
+                "Upgrade failed; previous images, keys and data were restored."
+            ) from None
+        raise RuntimeError(
+            "Upgrade ingress activation failed; services stopped and candidate data preserved. Repeat upgrade --finish-upgrade; no backup will be imported."
+        ) from None
+    print("Upgrade completed; catalog, issued codes and encryption keys retained.")
+
+
+def stopped_state_probe_after_stop(directory, meta):
+    compose(directory, "stop", "web", "cards")
+    return stopped_state_probe(directory, meta, pending_guard_script())
+
+
+def upgrade(directory, meta, migrate_legacy=False):
+    if any(
+        (directory / name).exists()
+        for name in [
+            "setup.pending.json",
+            "recovery.pending.json",
+            "migration.pending.json",
+            "upgrade.pending.json",
+        ]
+    ):
+        raise RuntimeError(
+            "Complete the recorded installation, recovery or legacy migration before upgrading."
+        )
+    no_players(directory)
+    pending = (
+        "0"
+        if migrate_legacy
+        else compose(
+            directory,
+            "exec",
+            "-T",
+            "cards",
+            "node",
+            "--input-type=module",
+            "-e",
+            live_pending_guard_script(),
+            capture=True,
+        ).strip()
+    )
     if pending != "0":
         raise RuntimeError("Finish pending purchases before upgrading.")
     previous = json.loads((directory / "compose.json").read_text(encoding="utf-8"))
+    previous_locks = (directory / "images.lock.json").read_bytes()
     settings = dict(
         line.split("=", 1)
         for line in (directory / "private/cards.env")
@@ -2030,66 +2751,69 @@ def upgrade(directory, meta):
         ),
         encoding="utf-8",
     )
-    candidate = create_compose(new_meta, lock_images(directory))
+    candidate_locks = lock_images(directory)
+    candidate = create_compose(new_meta, candidate_locks)
     private_file(directory / "compose.json", json.dumps(candidate, indent=2) + "\n")
     try:
         compose(directory, "build")
     except Exception:
         private_file(directory / "compose.json", json.dumps(previous, indent=2) + "\n")
+        private_file(directory / "images.lock.json", previous_locks)
         raise
     private_file(directory / "compose.json", json.dumps(previous, indent=2) + "\n")
-    safety = backup(directory, meta, restart=False, require_resolved=True)
-    if "ENABLE_SERIES_ONE_REWARDS" not in settings:
-        path = directory / "private/cards.env"
-        private_file(
-            path,
-            path.read_text(encoding="utf-8").rstrip()
-            + "\nENABLE_SERIES_ONE_REWARDS="
-            + rewards
-            + "\n",
-        )
-    if "ASSET_ROOT" not in settings:
-        path = directory / "private/cards.env"
-        private_file(
-            path, path.read_text(encoding="utf-8").rstrip() + "\nASSET_ROOT=/assets\n"
-        )
-    staged = json.loads(json.dumps(candidate))
-    staged["services"]["network"]["ports"] = []
-    private_file(directory / "compose.json", json.dumps(staged, indent=2) + "\n")
-    private_file(directory / "installation.json", json.dumps(new_meta, indent=2) + "\n")
-    try:
-        recreate_namespace(directory)
-        start(directory, new_meta)
-    except Exception as error:
-        try:
-            restore_data(directory, meta, safety)
-        except Exception:
-            raise RuntimeError(
-                "Upgrade and rollback both failed. Stop services and restore the safety backup: "
-                + str(safety)
-            ) from error
-        raise RuntimeError(
-            "Upgrade failed; previous images, keys and data were restored."
-        ) from None
-    # No public game or website ingress was available during validation. From this point
-    # onward preserve new transactions even if the final ingress activation has a fault.
-    private_file(directory / "compose.json", json.dumps(candidate, indent=2) + "\n")
-    try:
-        recreate_namespace(directory)
-        start(directory, new_meta)
-    except Exception as error:
-        try:
-            compose(directory, "stop", "web", "cards", "cosmic")
-        except Exception:
-            raise RuntimeError(
-                "Upgrade ingress activation and service shutdown failed. Preserve candidate data and inspect services; no backup was restored. Safety backup: "
-                + str(safety)
-            ) from error
-        raise RuntimeError(
-            "Upgrade ingress activation failed; services stopped and candidate data preserved. Inspect configuration and run start; do not restore over new transactions. Safety backup: "
-            + str(safety)
-        ) from error
-    print("Upgrade completed; catalog, issued codes and encryption keys retained.")
+    private_file(directory / "images.lock.json", previous_locks)
+    run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=16m",
+            "--user",
+            "10002:10002",
+            "--entrypoint",
+            "node",
+            candidate["services"]["cards"]["image"],
+            "--input-type=module",
+            "-e",
+            migration_candidate_probe_script(),
+        ],
+        capture=True,
+        structured_error=True,
+    )
+    candidate_runtime_images = migration_images(candidate)
+    safety = backup(
+        directory,
+        meta,
+        restart=False,
+        require_resolved=not migrate_legacy,
+        require_legacy=migrate_legacy,
+    )
+    marker = {
+        "format": 1,
+        "kind": "legacy" if migrate_legacy else "upgrade",
+        "phase": "staging",
+        "meta": new_meta,
+        "oldMeta": meta,
+        "candidate": candidate,
+        "backup": str(safety),
+        "backupDigest": file_hash(safety / "checksums.json"),
+        "oldBinding": migration_binding(directory),
+        "candidateLocks": candidate_locks,
+        "runtimeImages": candidate_runtime_images,
+    }
+    values = migration_staging_bytes(marker, safety)
+    marker["newBinding"] = {
+        name: hashlib.sha256(value).hexdigest() for name, value in values.items()
+    }
+    write_migration(directory, marker)
+    if migrate_legacy:
+        finish_legacy_migration(directory, meta)
+    else:
+        finish_ordinary_upgrade(directory, meta)
 
 
 def enable_series_one(directory, meta, products):
@@ -2104,7 +2828,12 @@ def enable_series_one(directory, meta, products):
         raise ValueError("Provide unique published pack IDs separated by commas.")
     if any(
         (directory / name).exists()
-        for name in ["setup.pending.json", "recovery.pending.json"]
+        for name in [
+            "setup.pending.json",
+            "recovery.pending.json",
+            "migration.pending.json",
+            "upgrade.pending.json",
+        ]
     ):
         raise RuntimeError("Complete installation or recovery before enabling rewards.")
     profile = json.loads((directory / "compose.json").read_text(encoding="utf-8"))
@@ -2221,6 +2950,202 @@ def enable_series_one(directory, meta, products):
     print(json.dumps(result))
 
 
+def attribute_legacy_payment(
+    directory, meta, order_id, decision_key, operator_id, reason
+):
+    if (
+        not isinstance(order_id, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", order_id)
+        or not isinstance(decision_key, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", decision_key)
+        or any(
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > maximum
+            or re.search(r"[\x00-\x1f\x7f]", value)
+            for value, maximum in [(operator_id, 128), (reason, 500)]
+        )
+    ):
+        raise ValueError(
+            "Provide the original order ID, stable decision key, operator identity and concise reason."
+        )
+    if any(
+        (directory / name).exists()
+        for name in [
+            "upgrade.pending.json",
+            "setup.pending.json",
+            "recovery.pending.json",
+        ]
+    ):
+        raise RuntimeError(
+            "Complete recorded ordinary upgrade, setup or recovery before legacy attribution."
+        )
+    path = directory / "migration.pending.json"
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > 65536:
+        raise RuntimeError("Legacy attribution requires a recorded closed migration.")
+    marker_digest = file_hash(path)
+    marker = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(marker, dict)
+        or marker.get("format") != 1
+        or marker.get("kind") != "legacy"
+        or marker.get("phase") not in ["migrating", "validating"]
+        or marker.get("meta") != meta
+        or meta.get("directory") != str(directory)
+        or marker.get("binding") != migration_binding(directory)
+    ):
+        raise RuntimeError(
+            "Legacy attribution requires completed staging with unchanged migration identities."
+        )
+    if (
+        not isinstance(marker.get("backup"), str)
+        or not 1 <= len(marker["backup"]) <= 4096
+    ):
+        raise RuntimeError("The recorded original backup path is invalid.")
+    raw_backup = Path(marker["backup"])
+    if (
+        not raw_backup.is_absolute()
+        or raw_backup.resolve() != raw_backup
+        or not raw_backup.is_relative_to(directory / "backups")
+        or raw_backup == directory / "backups"
+        or any("," in str(p) for p in [directory, raw_backup])
+    ):
+        raise RuntimeError(
+            "Attribution must use the original retained managed backup path."
+        )
+    safety = validate_backup(raw_backup)
+    original = backup_identity(safety)
+    if (
+        file_hash(safety / "checksums.json") != marker.get("backupDigest")
+        or original != marker.get("oldMeta")
+        or original.get("project") != meta.get("project")
+        or original.get("directory") != str(directory)
+        or marker.get("oldBinding") != migration_binding(safety)
+    ):
+        raise RuntimeError("The original migration backup identity differs.")
+    profile = create_compose(
+        meta, json.loads((directory / "images.lock.json").read_text(encoding="utf-8"))
+    )
+    closed = json.loads(json.dumps(profile))
+    closed["services"]["network"]["ports"] = []
+    if (
+        marker.get("candidate") != profile
+        or migration_images(profile) != marker.get("runtimeImages")
+        or json.loads((directory / "compose.json").read_text(encoding="utf-8"))
+        != closed
+    ):
+        raise RuntimeError(
+            "Attribution requires the recorded candidate with all public ingress closed."
+        )
+    no_players(directory)
+    compose(directory, "stop", "web", "cards")
+    no_players(directory)
+    if any(
+        compose(
+            directory, "ps", "--status", "running", "-q", service, capture=True
+        ).strip()
+        for service in ["web", "cards"]
+    ):
+        raise RuntimeError("Bridge writers must remain stopped for attribution.")
+    if (
+        file_hash(path) != marker_digest
+        or migration_binding(directory) != marker["binding"]
+        or json.loads((directory / "compose.json").read_text(encoding="utf-8"))
+        != closed
+    ):
+        raise RuntimeError(
+            "Migration configuration changed; bridge writers remain stopped."
+        )
+    namespace = compose(directory, "ps", "-q", "network", capture=True).strip()
+    if not re.fullmatch(r"[a-f0-9]{64}", namespace):
+        raise RuntimeError("The recorded private game network must remain active.")
+    try:
+        result = json.loads(
+            run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    "container:" + namespace,
+                    "--user",
+                    "0:0",
+                    "--cap-drop",
+                    "ALL",
+                    "--cap-add",
+                    "DAC_READ_SEARCH",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--read-only",
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=272m",
+                    "--env-file",
+                    str(directory / "private/cards.env"),
+                    "--mount",
+                    "type=bind,source="
+                    + str(directory)
+                    + ",target="
+                    + str(directory)
+                    + ",readonly",
+                    "--mount",
+                    "type=bind,source="
+                    + str(safety)
+                    + ",target="
+                    + str(safety)
+                    + ",readonly",
+                    "--mount",
+                    "type=volume,source="
+                    + meta["project"]
+                    + "_card_state,target=/opt/card/state,readonly",
+                    "--entrypoint",
+                    "node",
+                    profile["services"]["cards"]["image"],
+                    "tools/payments.mjs",
+                    "attribute-legacy",
+                    "--deployment-directory",
+                    str(directory),
+                    "--order-id",
+                    order_id,
+                    "--decision-key",
+                    decision_key,
+                    "--operator-id",
+                    operator_id,
+                    "--reason",
+                    reason,
+                    "--confirm-bridge-stopped",
+                ],
+                capture=True,
+                structured_error=True,
+            )
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("orderId") != order_id
+            or result.get("decisionKey") != decision_key
+            or result.get("state") != "attributed"
+            or not isinstance(result.get("evidenceFingerprint"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", result["evidenceFingerprint"])
+        ):
+            raise RuntimeError("Invalid attribution response")
+    except Exception as error:
+        code = getattr(error, "code", None)
+        reason_code = (
+            " (" + code + ")"
+            if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,80}", code)
+            else ""
+        )
+        raise RuntimeError(
+            "Legacy attribution did not confirm completion"
+            + reason_code
+            + "; bridge writers remain stopped and migration ingress closed. Retry the exact decision and terms; no services were reopened."
+        ) from None
+    print(json.dumps(result))
+    print(
+        "Attribution verified; bridge writers remain stopped and migration ingress closed. No wallet, cards, adoption or refund were changed."
+    )
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2265,8 +3190,31 @@ def main():
         "--catalog",
         help="Install a collectible catalog, including imported packs with direct-source images",
     )
-    for name in ["start", "doctor", "stop", "backup", "upgrade", "smoke"]:
+    for name in ["start", "doctor", "stop", "smoke"]:
         commands.add_parser(name)
+    backup_parser = commands.add_parser("backup")
+    backup_parser.add_argument(
+        "--keep-stopped",
+        action="store_true",
+        help="Take a consistent backup without restarting writers or reopening a migration fence",
+    )
+    upgrade_parser = commands.add_parser("upgrade")
+    migration = upgrade_parser.add_mutually_exclusive_group()
+    migration.add_argument(
+        "--migrate-legacy-payments",
+        action="store_true",
+        help="Migrate legacy framework state into a verified recovery runtime with ingress closed until payment proof is complete",
+    )
+    migration.add_argument(
+        "--finish-legacy-migration",
+        action="store_true",
+        help="Privately verify the recorded migration and payment closure before activation; preserve current data",
+    )
+    migration.add_argument(
+        "--finish-upgrade",
+        action="store_true",
+        help="Resume the recorded ordinary upgrade or its rollback; preserve data after activation",
+    )
     recover = commands.add_parser("restore")
     recover.add_argument("--backup", required=True)
     disaster = commands.add_parser(
@@ -2295,6 +3243,12 @@ def main():
     rewards.add_argument(
         "--products", required=True, help="Comma-separated published pack IDs"
     )
+    attribution = commands.add_parser(
+        "attribute-legacy-payment",
+        help="Attribute one retained legacy payment from its original verified migration backup; keep ingress closed",
+    )
+    for name in ["order-id", "decision-key", "operator-id", "reason"]:
+        attribution.add_argument("--" + name, required=True)
     admin = commands.add_parser(
         "admin", help="Manage website administrators independently of game GM roles"
     )
@@ -2333,11 +3287,25 @@ def main():
         no_players(directory)
         compose(directory, "stop", "web", "cards", "cosmic", "network", "db")
     elif args.command == "backup":
-        backup(directory, meta)
+        backup(directory, meta, restart=not args.keep_stopped)
     elif args.command == "restore":
         restore(directory, meta, args.backup)
     elif args.command == "upgrade":
-        upgrade(directory, meta)
+        if args.finish_upgrade:
+            finish_ordinary_upgrade(directory, meta)
+        elif args.finish_legacy_migration:
+            finish_legacy_migration(directory, meta)
+        else:
+            upgrade(directory, meta, migrate_legacy=args.migrate_legacy_payments)
+    elif args.command == "attribute-legacy-payment":
+        attribute_legacy_payment(
+            directory,
+            meta,
+            args.order_id,
+            args.decision_key,
+            args.operator_id,
+            args.reason,
+        )
     elif args.command == "smoke":
         smoke(directory, meta)
     elif args.command == "rewards":

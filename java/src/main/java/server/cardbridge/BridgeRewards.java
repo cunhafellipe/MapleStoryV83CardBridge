@@ -18,12 +18,20 @@ public final class BridgeRewards {
 
   static final String SESSION = UUID.randomUUID().toString();
 
-  record Pending(String issuance, String receipt, long usedAt, boolean delivered, Item cashItem) {}
+  record Pending(
+      String issuance,
+      String receipt,
+      long usedAt,
+      boolean delivered,
+      Item cashItem,
+      Character owner) {}
 
   private static final ConcurrentHashMap<Integer, Pending> pending = new ConcurrentHashMap<>();
 
   static boolean hasPending(Character chr) {
-    return pending.containsKey(chr.getId());
+    return pending.containsKey(chr.getId())
+        || BridgeCoupons.hasPending(chr)
+        || BridgeExchanges.hasPending(chr);
   }
 
   public static Map<String, Object> diagnostics() throws SQLException {
@@ -31,6 +39,25 @@ public final class BridgeRewards {
     Timestamp oldest = null;
     long callbacks, attempts, lastAttempt;
     try (Connection con = DatabaseConnection.getConnection()) {
+      try (Statement st = con.createStatement();
+          ResultSet rs =
+              st.executeQuery(
+                  "SELECT COUNT(*),COALESCE(SUM(amount),0),COALESCE(SUM(CASE WHEN refund_owed=TRUE"
+                      + " THEN 1 ELSE 0 END),0) FROM card_bridge_payments WHERE payment_state IN"
+                      + " ('DEBITED','LEGACY_PAID')")) {
+        rs.next();
+        result.put("pendingPayments", rs.getLong(1));
+        result.put("reservedRefundUnits", Long.toString(rs.getLong(2)));
+        result.put("owedRefunds", rs.getLong(3));
+      }
+      try (Statement st = con.createStatement();
+          ResultSet rs =
+              st.executeQuery(
+                  "SELECT COUNT(*) FROM card_bridge_coupon_claims WHERE state='PENDING'")) {
+        rs.next();
+        result.put("pendingCouponAwards", rs.getLong(1));
+      }
+      result.put("pendingExchanges", BridgeExchanges.pendingCount());
       try (Statement st = con.createStatement();
           ResultSet rs =
               st.executeQuery(
@@ -152,117 +179,108 @@ public final class BridgeRewards {
     }
     Character chr = c.getPlayer();
     synchronized (chr) {
-      String id = null;
-      int item = 0, qty = 0;
-      Item cashReward = null;
-      boolean grant = false;
-      Pending claimRecord = null;
-      try {
-        BridgeHttp.requireLease();
-        try (Connection con = DatabaseConnection.getConnection()) {
-          con.setAutoCommit(false);
-          try {
-            try (PreparedStatement ps =
-                con.prepareStatement(
-                    "SELECT * FROM card_bridge_codes WHERE code_hash=? FOR UPDATE")) {
-              ps.setString(1, hash);
-              try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) {
-                  con.rollback();
-                  return false;
-                }
-                if (rs.getInt("account_id") != c.getAccID())
-                  throw new BridgeHttp.Problem(
-                      403, "WRONG_ACCOUNT", "This code belongs to another account.");
-                id = rs.getString("issuance_id");
-                item = rs.getInt("item_id");
-                qty = rs.getInt("quantity");
-                if ("USED".equals(rs.getString("state")))
-                  throw new BridgeHttp.Problem(409, "USED", "This code has already been used.");
-                if ("PENDING".equals(rs.getString("state"))
-                    && SESSION.equals(rs.getString("claim_session"))) {
-                  Pending old = pending.get(chr.getId());
-                  if (old == null
-                      || !old.issuance().equals(id)
-                      || rs.getInt("claim_character") != chr.getId())
-                    throw new BridgeHttp.Problem(
-                        409, "PENDING", "This reward is being saved. Please try shortly.");
-                } else {
-                  if (pending.containsKey(chr.getId()))
-                    throw new BridgeHttp.Problem(
-                        409, "PENDING", "Finish saving the previous reward first.");
-                  boolean cash = ItemInformationProvider.getInstance().isCash(item);
-                  if (cash
-                      ? chr.getCashShop().getItemsSize() >= 100
-                      : chr.getInventory(ItemConstants.getInventoryType(item)).getNextFreeSlot()
-                          == -1)
-                    throw new BridgeHttp.Problem(
-                        409, "INVENTORY_FULL", "Please leave one free slot for your reward.");
-                  String receipt = UUID.randomUUID().toString();
-                  try (PreparedStatement claim =
-                      con.prepareStatement(
-                          "UPDATE card_bridge_codes SET"
-                              + " state='PENDING',claim_session=?,claim_character=?,receipt_id=?"
-                              + " WHERE issuance_id=?")) {
-                    claim.setString(1, SESSION);
-                    claim.setInt(2, chr.getId());
-                    claim.setString(3, receipt);
-                    claim.setString(4, id);
-                    claim.executeUpdate();
+      try (BridgeCharacters.Guard guard = BridgeCharacters.save(chr)) {
+        if (!BridgeCharacters.current(chr)) {
+          c.enableCSActions();
+          return true;
+        }
+        String id = null;
+        int item = 0, qty = 0;
+        Item cashReward = null;
+        boolean grant = false;
+        Pending claimRecord = null;
+        try {
+          BridgeHttp.requireLease();
+          try (Connection con = DatabaseConnection.getConnection()) {
+            con.setAutoCommit(false);
+            try {
+              try (PreparedStatement ps =
+                  con.prepareStatement(
+                      "SELECT * FROM card_bridge_codes WHERE code_hash=? FOR UPDATE")) {
+                ps.setString(1, hash);
+                try (ResultSet rs = ps.executeQuery()) {
+                  if (!rs.next()) {
+                    con.rollback();
+                    return false;
                   }
-                  claimRecord = new Pending(id, receipt, System.currentTimeMillis(), false, null);
-                  grant = true;
+                  if (rs.getInt("account_id") != c.getAccID())
+                    throw new BridgeHttp.Problem(
+                        403, "WRONG_ACCOUNT", "This code belongs to another account.");
+                  id = rs.getString("issuance_id");
+                  item = rs.getInt("item_id");
+                  qty = rs.getInt("quantity");
+                  if ("USED".equals(rs.getString("state")))
+                    throw new BridgeHttp.Problem(409, "USED", "This code has already been used.");
+                  if ("PENDING".equals(rs.getString("state"))
+                      && SESSION.equals(rs.getString("claim_session"))) {
+                    Pending old = pending.get(chr.getId());
+                    if (old == null
+                        || !old.issuance().equals(id)
+                        || rs.getInt("claim_character") != chr.getId())
+                      throw new BridgeHttp.Problem(
+                          409, "PENDING", "This reward is being saved. Please try shortly.");
+                  } else {
+                    if (pending.containsKey(chr.getId()))
+                      throw new BridgeHttp.Problem(
+                          409, "PENDING", "Finish saving the previous reward first.");
+                    boolean cash = ItemInformationProvider.getInstance().isCash(item);
+                    if (cash
+                        ? chr.getCashShop().getItemsSize() >= 100
+                        : chr.getInventory(ItemConstants.getInventoryType(item)).getNextFreeSlot()
+                            == -1)
+                      throw new BridgeHttp.Problem(
+                          409, "INVENTORY_FULL", "Please leave one free slot for your reward.");
+                    String receipt = UUID.randomUUID().toString();
+                    try (PreparedStatement claim =
+                        con.prepareStatement(
+                            "UPDATE card_bridge_codes SET"
+                                + " state='PENDING',claim_session=?,claim_character=?,receipt_id=?"
+                                + " WHERE issuance_id=?")) {
+                      claim.setString(1, SESSION);
+                      claim.setInt(2, chr.getId());
+                      claim.setString(3, receipt);
+                      claim.setString(4, id);
+                      claim.executeUpdate();
+                    }
+                    claimRecord =
+                        new Pending(id, receipt, System.currentTimeMillis(), false, null, chr);
+                    grant = true;
+                  }
                 }
               }
+              BridgeHttp.requireLease();
+              con.commit();
+            } catch (Exception e) {
+              try {
+                con.rollback();
+              } catch (SQLException rollbackError) {
+                e.addSuppressed(rollbackError);
+              }
+              throw e;
             }
-            BridgeHttp.requireLease();
-            con.commit();
-          } catch (Exception e) {
+          } catch (SQLException uncertain) {
+            // Includes commit acknowledgement and connection-close failures. The old
+            // transaction is closed before a fresh connection verifies its exact claim.
+            if (!grant || claimRecord == null) throw uncertain;
+            boolean committed;
             try {
-              con.rollback();
-            } catch (SQLException rollbackError) {
-              e.addSuppressed(rollbackError);
+              committed = claimCommitted(claimRecord, chr.getId(), c.getAccID());
+            } catch (SQLException unavailable) {
+              BridgeHttp.uncertainCommit();
+              throw unavailable;
             }
-            throw e;
+            if (!committed) throw uncertain;
           }
-        } catch (SQLException uncertain) {
-          // Includes commit acknowledgement and connection-close failures. The old
-          // transaction is closed before a fresh connection verifies its exact claim.
-          if (!grant || claimRecord == null) throw uncertain;
-          boolean committed;
-          try {
-            committed = claimCommitted(claimRecord, chr.getId(), c.getAccID());
-          } catch (SQLException unavailable) {
-            BridgeHttp.uncertainCommit();
-            throw unavailable;
-          }
-          if (!committed) throw uncertain;
-        }
-        if (grant) {
-          pending.put(chr.getId(), claimRecord);
-          // One new stack avoids partial merges and makes the delivery boundary explicit.
-          if (ItemInformationProvider.getInstance().isCash(item)) {
-            Item reward = CashShop.generateCouponItem(item, (short) qty);
-            if (ItemConstants.isPet(item))
-              reward.setExpiration(
-                  System.currentTimeMillis() + java.util.concurrent.TimeUnit.DAYS.toMillis(30));
-            chr.getCashShop().addToInventory(reward);
-            cashReward = reward;
-            pending.put(
-                chr.getId(),
-                new Pending(
-                    claimRecord.issuance(),
-                    claimRecord.receipt(),
-                    claimRecord.usedAt(),
-                    true,
-                    reward));
-          } else {
-            Inventory inv = chr.getInventory(ItemConstants.getInventoryType(item));
-            inv.lockInventory();
-            try {
-              Item reward = new Item(item, (short) 0, (short) qty, -1);
-              if (inv.addItem(reward) == -1)
-                throw new IllegalStateException("Reserved inventory slot is unavailable");
+          if (grant) {
+            pending.put(chr.getId(), claimRecord);
+            // One new stack avoids partial merges and makes the delivery boundary explicit.
+            if (ItemInformationProvider.getInstance().isCash(item)) {
+              Item reward = CashShop.generateCouponItem(item, (short) qty);
+              if (ItemConstants.isPet(item))
+                reward.setExpiration(
+                    System.currentTimeMillis() + java.util.concurrent.TimeUnit.DAYS.toMillis(30));
+              chr.getCashShop().addToInventory(reward);
+              cashReward = reward;
               pending.put(
                   chr.getId(),
                   new Pending(
@@ -270,68 +288,110 @@ public final class BridgeRewards {
                       claimRecord.receipt(),
                       claimRecord.usedAt(),
                       true,
-                      null));
-              c.sendPacket(
-                  PacketCreator.modifyInventory(true, List.of(new ModifyInventory(0, reward))));
-            } finally {
-              inv.unlockInventory();
+                      reward,
+                      chr));
+            } else {
+              Inventory inv = chr.getInventory(ItemConstants.getInventoryType(item));
+              inv.lockInventory();
+              try {
+                Item reward = new Item(item, (short) 0, (short) qty, -1);
+                if (inv.addItem(reward) == -1)
+                  throw new IllegalStateException("Reserved inventory slot is unavailable");
+                pending.put(
+                    chr.getId(),
+                    new Pending(
+                        claimRecord.issuance(),
+                        claimRecord.receipt(),
+                        claimRecord.usedAt(),
+                        true,
+                        null,
+                        chr));
+                c.sendPacket(
+                    PacketCreator.modifyInventory(true, List.of(new ModifyInventory(0, reward))));
+              } finally {
+                inv.unlockInventory();
+              }
             }
           }
-        }
-        Pending delivery = pending.get(chr.getId());
-        if (delivery != null) cashReward = delivery.cashItem();
-        chr.saveCharToDB(true);
-        if (!"USED".equals(status(id).get("status")))
-          throw new IllegalStateException("Reward save is pending");
-        c.sendPacket(
-            PacketCreator.showCouponRedeemedItems(
-                c.getAccID(),
-                0,
-                0,
-                cashReward == null ? List.of() : List.of(cashReward),
-                cashReward == null ? List.of(new tools.Pair<>(item, qty)) : List.of()));
-        chr.dropMessage(
-            5,
-            "Card code granted "
-                + qty
-                + " "
-                + ItemInformationProvider.getInstance().getName(item)
-                + ".");
-        c.enableCSActions();
-        return true;
-      } catch (Exception e) {
-        Pending unfinished = pending.get(chr.getId());
-        if (unfinished != null && !unfinished.delivered()) {
-          try (Connection con = DatabaseConnection.getConnection();
-              PreparedStatement ps =
-                  con.prepareStatement(
-                      "UPDATE card_bridge_codes SET"
-                          + " state='READY',claim_session=NULL,claim_character=NULL,receipt_id=NULL"
-                          + " WHERE issuance_id=? AND state='PENDING' AND claim_session=?")) {
-            ps.setString(1, unfinished.issuance());
-            ps.setString(2, SESSION);
-            ps.executeUpdate();
-            pending.remove(chr.getId(), unfinished);
-          } catch (SQLException ignored) {
-            /* Keep the unsaved claim blocked until storage recovers. */
+          Pending delivery = pending.get(chr.getId());
+          if (delivery != null) cashReward = delivery.cashItem();
+          chr.saveCharToDB(true);
+          if (!"USED".equals(status(id).get("status")))
+            throw new IllegalStateException("Reward save is pending");
+          c.sendPacket(
+              PacketCreator.showCouponRedeemedItems(
+                  c.getAccID(),
+                  0,
+                  0,
+                  cashReward == null ? List.of() : List.of(cashReward),
+                  cashReward == null ? List.of(new tools.Pair<>(item, qty)) : List.of()));
+          chr.dropMessage(
+              5,
+              "Card code granted "
+                  + qty
+                  + " "
+                  + ItemInformationProvider.getInstance().getName(item)
+                  + ".");
+          c.enableCSActions();
+          return true;
+        } catch (Exception e) {
+          Pending unfinished = pending.get(chr.getId());
+          if (unfinished != null && !unfinished.delivered()) {
+            try (Connection con = DatabaseConnection.getConnection();
+                PreparedStatement ps =
+                    con.prepareStatement(
+                        "UPDATE card_bridge_codes SET"
+                            + " state='READY',claim_session=NULL,claim_character=NULL,receipt_id=NULL"
+                            + " WHERE issuance_id=? AND state='PENDING' AND claim_session=?")) {
+              ps.setString(1, unfinished.issuance());
+              ps.setString(2, SESSION);
+              ps.executeUpdate();
+              pending.remove(chr.getId(), unfinished);
+            } catch (SQLException ignored) {
+              /* Keep the unsaved claim blocked until storage recovers. */
+            }
           }
+          c.sendPacket(PacketCreator.showCashShopMessage((byte) 0xB1));
+          chr.dropMessage(
+              5,
+              e instanceof BridgeHttp.Problem
+                  ? e.getMessage()
+                  : "The reward could not finish saving. Please try this code again.");
+          c.enableCSActions();
+          return true;
         }
-        c.sendPacket(PacketCreator.showCashShopMessage((byte) 0xB1));
-        chr.dropMessage(
-            5,
-            e instanceof BridgeHttp.Problem
-                ? e.getMessage()
-                : "The reward could not finish saving. Please try this code again.");
-        c.enableCSActions();
-        return true;
       }
     }
   }
 
+  static void replace(Character chr) throws SQLException {
+    Pending old = pending.get(chr.getId());
+    if (old == null) return;
+    try (Connection con = DatabaseConnection.getConnection();
+        PreparedStatement ps =
+            con.prepareStatement(
+                "UPDATE card_bridge_codes SET"
+                    + " state='READY',claim_session=NULL,claim_character=NULL,receipt_id=NULL WHERE"
+                    + " issuance_id=? AND state='PENDING' AND claim_session=? AND claim_character=?"
+                    + " AND receipt_id=?")) {
+      ps.setString(1, old.issuance());
+      ps.setString(2, SESSION);
+      ps.setInt(3, chr.getId());
+      ps.setString(4, old.receipt());
+      ps.executeUpdate();
+    }
+    pending.remove(chr.getId(), old);
+  }
+
   public static void beforeSave(Connection con, Character chr) throws SQLException {
     if (!BridgeHttp.enabled()) return;
+    BridgeHttp.requireLease();
+    if (!BridgeCharacters.current(chr)) throw new SQLException("Replaced inventory character");
+    BridgeCoupons.beforeSave(con, chr);
+    BridgeExchanges.beforeSave(con, chr);
     Pending p = pending.get(chr.getId());
     if (p == null) return;
+    if (p.owner() != chr) throw new SQLException("Replaced code reward character");
     BridgeHttp.requireLease();
     if (!p.delivered()) throw new SQLException("Reward delivery is incomplete");
     try (PreparedStatement ps =
@@ -403,6 +463,10 @@ public final class BridgeRewards {
   }
 
   public static void afterSave(Character chr) {
-    if (BridgeHttp.enabled()) pending.remove(chr.getId());
+    if (BridgeHttp.enabled()) {
+      pending.computeIfPresent(chr.getId(), (id, p) -> p.owner() == chr ? null : p);
+      BridgeCoupons.afterSave(chr);
+      BridgeExchanges.afterSave(chr);
+    }
   }
 }

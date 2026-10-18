@@ -1,6 +1,7 @@
 import { key, fail } from "./protocol.mjs";
-import { cashTypes } from "./cash-types.mjs";
 import { Administration } from "./administration.mjs";
+import { PaymentAuthority } from "./payment-authority.mjs";
+import { PaymentCoordinator } from "./payment-coordinator.mjs";
 export const operator = { role: "admin" };
 export class Library {
   #locks = new Map();
@@ -13,17 +14,21 @@ export class Library {
     game,
     acceptedCashTypes = [1, 2, 4],
     rewardsEnabled = false,
+    paymentAuthority = new PaymentAuthority(),
   }) {
-    if (typeof framework?.backfillCompletionReservations !== "function")
-      throw Error(
-        "Incompatible framework runtime. Install the pinned bridge dependencies before starting.",
-      );
-    framework.backfillCompletionReservations(operator);
+    for (const method of ["prepareExternalPurchase", "commitExternalPurchase",
+      "cancelExternalPurchase", "confirmExternalCompensation", "lookupExternalPurchase",
+      "pendingExternalPurchases", "backfillCompletionReservations"])
+      if (typeof framework?.[method] !== "function")
+        throw Error("Incompatible framework runtime. Install the pinned bridge dependencies before starting.");
     this.core = framework;
+    this.core.backfillCompletionReservations(operator);
     this.store = store;
     this.journal = journal;
     this.game = game;
     this.acceptedCashTypes = acceptedCashTypes;
+    this.payments = new PaymentCoordinator({ core: framework, store, journal,
+      game: (path, input) => this.game(path, input), authority: paymentAuthority });
     this.admin = new Administration(this, { rewardsEnabled });
   }
   actor(person) {
@@ -88,28 +93,8 @@ export class Library {
     wallet.acceptedCashTypes = (wallet.acceptedCashTypes ?? [1, 2, 4]).filter(
       (t) => this.acceptedCashTypes.includes(t),
     );
-    const inventory = this.core
-        .inventory(actor)
-        .sort(
-          (a, b) =>
-            (b.createdAt ?? b.at ?? "").localeCompare(
-              a.createdAt ?? a.at ?? "",
-            ) || a.id.localeCompare(b.id),
-        ),
-      groups = new Map();
-    let totalCards = 0;
-    for (const card of inventory) {
-      if (card.definition.type === "code") continue;
-      totalCards++;
-      const row = groups.get(card.variantId);
-      if (row) row.count++;
-      else
-        groups.set(card.variantId, {
-          variantId: card.variantId,
-          count: 1,
-          card,
-        });
-    }
+    const inventory = this.core.inventoryPage(actor, { limit: 50 }),
+      collection = this.core.collectionSummary(actor, { limit: 200, excludeTypes: ["code"] });
     const packPage = this.packPage(person, { limit: 50 });
     return {
       owner: person.name,
@@ -120,16 +105,12 @@ export class Library {
       packs: packPage.items,
       packNext: packPage.next,
       packTotal: packPage.total,
-      inventory: inventory.slice(0, 50),
-      inventoryNext: inventory.length > 50 ? inventory[49].id : null,
-      inventoryTotal: inventory.length,
-      collection: {
-        items: [...groups.values()],
-        totalCards,
-        uniqueCards: groups.size,
-      },
+      inventory: inventory.items,
+      inventoryNext: inventory.next,
+      inventoryTotal: inventory.total,
+      collection,
       codes,
-      albums: this.core.albums(actor),
+      albums: this.store.query((q) => Object.values(q.value("albums") ?? {}).filter((album) => album.ownerId === actor.userId)),
       codeNext: codePage.next,
       codeTotal: codePage.total,
       orders: this.journal.orders(person.accountId).map((o) => ({
@@ -143,7 +124,7 @@ export class Library {
   inventoryPage(person, { after = "", limit = 50 } = {}) {
     if (
       typeof after !== "string" ||
-      after.length > 100 ||
+      after.length > 512 ||
       !Number.isInteger(limit) ||
       limit < 1 ||
       limit > 100
@@ -154,10 +135,15 @@ export class Library {
       );
     return this.core.inventoryPage(this.actor(person), { after, limit });
   }
+  collectionPage(person, { after = "", limit = 200 } = {}) {
+    if (typeof after !== "string" || after.length > 512 || !Number.isInteger(limit) || limit < 1 || limit > 200)
+      fail("INVALID_PAGE", "Use a supplied collection cursor and a limit from 1 to 200.");
+    return this.core.collectionSummary(this.actor(person), { after, limit, excludeTypes: ["code"] });
+  }
   packPage(person, { after = "", limit = 50 } = {}) {
     if (
       typeof after !== "string" ||
-      after.length > 100 ||
+      after.length > 512 ||
       !Number.isInteger(limit) ||
       limit < 1 ||
       limit > 100
@@ -166,21 +152,13 @@ export class Library {
         "INVALID_PAGE",
         "Use a supplied pack cursor and a limit from 1 to 100.",
       );
-    const packs = this.core
-      .packs(this.actor(person))
-      .filter((p) => !p.openedAt);
-    const start = after ? packs.findIndex((p) => p.id === after) + 1 : 0;
-    if (after && !start)
-      fail("INVALID_CURSOR", "Pack list changed. Refresh this view.", 409);
-    const items = packs.slice(start, start + limit);
-    return {
-      items,
-      next: start + limit < packs.length ? items.at(-1).id : null,
-      total: packs.length,
-    };
+    return this.core.packsPage(this.actor(person), { after, limit, status: "unopened", sort: "ordinal" });
   }
   codePage(person, { after = "", limit = 50 } = {}) {
-    const page = this.core.codeHistory(this.actor(person), { after, limit });
+    if (typeof after !== "string" || after.length > 512 || !Number.isInteger(limit) || limit < 1 || limit > 100)
+      fail("INVALID_PAGE", "Use a supplied code cursor and a limit from 1 to 100.");
+    const actor = this.actor(person);
+    const page = this.core.codeHistory(actor, { after, limit });
     return {
       ...page,
       items: page.items.map((c) => ({
@@ -232,7 +210,7 @@ export class Library {
   }
   async coordinatePublication(work) {
     return this.#coordinate(async () => {
-      if (this.journal.pending().length)
+      if (this.journal.pending().length || this.journal.diagnostics().orphanedPayments)
         fail(
           "PURCHASE_PENDING",
           "Complete outstanding purchases before publishing a catalog.",
@@ -246,7 +224,7 @@ export class Library {
       return {
         ok:
           (!this.store.integrity || this.store.integrity()) &&
-          this.journal.writable(),
+          this.journal.writable() && !this.journal.diagnostics().orphanedPayments,
         profile: "single-writer",
         capacity: this.core.capacity?.() ?? { qualified: false },
       };
@@ -329,7 +307,7 @@ export class Library {
       return await pending;
     } catch (error) {
       const order = this.journal.order(id);
-      if (order && !["complete", "rejected"].includes(order.state))
+      if (order && !["complete", "rejected", "refunded"].includes(order.state))
         this.journal.failed(order, error);
       throw error;
     } finally {
@@ -337,69 +315,25 @@ export class Library {
     }
   }
   async #resume(order, { shouldStop = () => false } = {}) {
-    if (order.state === "complete") return order.result;
-    if (order.state === "rejected")
-      fail(
-        "PURCHASE_REJECTED",
-        "This purchase was declined. Review your balance and try a new purchase.",
-        409,
-      );
-    this.journal.attempt(order);
-    if (order.state === "pending") {
-      try {
-        const paid = await this.game("/debit", {
-          orderId: order.id,
-          accountId: order.accountId,
-          amount: order.quote.price.amount,
-          cashType: order.input.cashType ?? 1,
-        });
-        if (
-          paid.orderId !== order.id ||
-          paid.amount !== order.quote.price.amount ||
-          paid.accountId !== order.accountId ||
-          paid.cashType !== (order.input.cashType ?? 1)
-        )
-          fail("GAME_UNAVAILABLE", "Invalid payment receipt.", 503);
-        order.payment = paid;
-        this.journal.save(order, "paid");
-        order.state = "paid";
-      } catch (e) {
-        if (
-          e.code === "INSUFFICIENT_FUNDS" ||
-          e.code === "ACCOUNT_UNAVAILABLE"
-        ) {
-          this.journal.save(order, "rejected");
-          order.state = "rejected";
-        }
-        this.journal.failed(order, e);
-        throw e;
-      }
-    }
-    // Retried settlement and purchase share durable identities; neither can mint twice.
-    this.core.settleExternalCredit(operator, {
-      providerId: "maplestory.v83",
-      transactionId: order.id,
-      userId: order.userId,
-      currencyId: "nx",
-      amount: order.quote.price.amount,
-      externalCurrency: cashTypes.find(
-        (c) => c.cashType === (order.input.cashType ?? 1),
-      ).externalCurrency,
-      externalUnits: String(order.quote.price.amount),
-    });
-    order.result = this.core.purchase(
-      { userId: order.userId },
-      { key: "purchase-" + order.id, ...order.input },
-    );
-    this.journal.save(order, "complete");
+    const result = await this.payments.resume(order);
     await this.reconcile({ accountId: order.accountId, shouldStop });
-    return order.result;
+    return result;
   }
   async recover({ shouldStop = () => false, force = true } = {}) {
     const startedAt = new Date().toISOString();
     let completed = 0,
       failed = 0;
-    for (const order of this.journal.pending().slice(0, 20)) {
+    if (shouldStop()) return;
+    try {
+      await this.#coordinate(() => this.payments.discover({ shouldStop }));
+    } catch (error) {
+      this.lastRecovery = { startedAt, completed, failed: 1, phase: "discovery",
+        failureCode: /^[A-Z][A-Z0-9_]{0,80}$/.test(error.code ?? "") ? error.code : "UNAVAILABLE",
+        finishedAt: new Date().toISOString() };
+      if (error.code === "GAME_UNAVAILABLE") return;
+      throw error;
+    }
+    for (const order of this.journal.dueOrders({ force, limit: 20 })) {
       if (shouldStop()) return;
       if (
         !force &&
@@ -413,8 +347,14 @@ export class Library {
         );
         completed++;
       } catch (error) {
+        const current = this.journal.order(order.id);
+        if (["complete", "rejected", "refunded"].includes(current.state)) {
+          completed++;
+          continue;
+        }
         failed++;
-        this.journal.failed(this.journal.order(order.id), error);
+        if (!["complete", "rejected", "refunded"].includes(current.state))
+          this.journal.failed(current, error);
         if (error.code === "GAME_UNAVAILABLE") break;
       }
     }
@@ -443,6 +383,7 @@ export class Library {
     force = false,
     shouldStop = () => false,
   } = {}) {
+    if (this.store.query((q) => q.pageCodes({ limit: 1 }).total) === 0) return;
     let after = "",
       attempts = 0;
     do {
@@ -457,9 +398,8 @@ export class Library {
           ["redeemed", "revoked"].includes(row.status)
         )
           continue;
-        const accountId = this.store.read((s) =>
-          Number(s.users[row.holderId]?.subject),
-        );
+        const identity = this.store.query((q) => q.providerIdentity(row.holderId)),
+          accountId = identity?.provider === "maplestory.v83" ? Number(identity.subject) : NaN;
         if (
           !Number.isSafeInteger(accountId) ||
           accountId < 1 ||

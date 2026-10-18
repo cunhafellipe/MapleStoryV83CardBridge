@@ -3,6 +3,7 @@
 import argparse
 import base64
 import copy
+import hashlib
 import http.cookiejar
 import importlib.util
 import json
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -102,7 +104,189 @@ def purchase(api, product_id, cash_type, identity):
     return result
 
 
-def qualify(directory, sandbox):
+def docker_command(directory, args, timeout=25):
+    result = subprocess.run(
+        ["docker", *args],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    assert result.returncode == 0, "Bounded Docker qualification command failed"
+    return result.stdout.strip()
+
+
+def native_sql(directory, query):
+    return docker_command(
+        directory,
+        [
+            "compose",
+            "-f",
+            str(directory / "compose.json"),
+            "exec",
+            "-T",
+            "db",
+            "sh",
+            "-c",
+            'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -uroot -N cosmic -e "$1"',
+            "qualification",
+            query,
+        ],
+    )
+
+
+def runtime_identity(directory, service):
+    identity = docker_command(
+        directory,
+        ["compose", "-f", str(directory / "compose.json"), "ps", "-aq", service],
+    )
+    assert identity and "\n" not in identity, "Expected one managed service container"
+    item = json.loads(docker_command(directory, ["inspect", identity]))[0]
+    return {
+        "id": item["Id"],
+        "image": item["Image"],
+        "restartCount": item["RestartCount"],
+        "startedAt": item["State"]["StartedAt"],
+        "state": item["State"]["Status"],
+        "restartPolicy": item["HostConfig"]["RestartPolicy"]["Name"],
+    }
+
+
+def durable_native_signature(directory):
+    queries = [
+        "SELECT id,nxCredit,maplePoint,nxPrepaid FROM accounts ORDER BY id;",
+        "SELECT * FROM card_bridge_payments ORDER BY order_id;",
+        "SELECT issuance_id,code_hash,account_id,item_id,quantity,pet_days,state,claim_session,claim_character,receipt_id,used_at FROM card_bridge_codes ORDER BY issuance_id;",
+        "SELECT receipt_id,account_id,character_id,cash_type,amount,kind FROM card_bridge_native_purchases ORDER BY receipt_id;",
+        "SELECT receipt_id,payload,delivered FROM card_bridge_outbox ORDER BY receipt_id;",
+    ]
+    return [
+        hashlib.sha256(native_sql(directory, query).encode()).hexdigest()
+        for query in queries
+    ]
+
+
+def require_stable_runtime(directory, meta):
+    assert not (directory / "setup.pending.json").exists()
+    assert not (directory / "recovery.pending.json").exists()
+    managed.no_players(directory)
+    managed.doctor(directory, meta)
+    game = runtime_identity(directory, "cosmic")
+    assert game["state"] == "running" and game["restartPolicy"] == "unless-stopped"
+    return game
+
+
+def require_supervised_recovery(directory, meta, before, fault_at):
+    deadline = time.monotonic() + 240
+    while True:
+        try:
+            managed.doctor(directory, meta)
+            after = runtime_identity(directory, "cosmic")
+            if after["restartCount"] > before["restartCount"]:
+                break
+        except (RuntimeError, AssertionError):
+            pass
+        assert (
+            time.monotonic() < deadline
+        ), "Lease loss did not recover under supervision"
+        time.sleep(5)
+    assert after["id"] == before["id"] and after["image"] == before["image"]
+    assert after["startedAt"] != before["startedAt"] and after["state"] == "running"
+    events = docker_command(
+        directory,
+        [
+            "events",
+            "--since",
+            str(fault_at),
+            "--until",
+            str(int(time.time())),
+            "--filter",
+            "container=" + before["id"],
+            "--filter",
+            "event=die",
+            "--format",
+            "{{json .}}",
+        ],
+    )
+    assert any(
+        event.get("time", 0) >= fault_at
+        and event.get("Actor", {}).get("ID") == before["id"]
+        and event.get("Actor", {}).get("Attributes", {}).get("exitCode") == "75"
+        for event in (json.loads(line) for line in events.splitlines())
+    ), "Actual lease-loss exit 75 was not observed"
+
+
+def qualify_native_runtime(directory, meta):
+    original = require_stable_runtime(directory, meta)
+    durable = durable_native_signature(directory)
+    logins = native_sql(directory, "SELECT id,loggedin FROM accounts ORDER BY id;")
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(directory / "compose.json"),
+            "exec",
+            "-T",
+            "cosmic",
+            "timeout",
+            "--kill-after=5s",
+            "35s",
+            "java",
+            "-Xms64m",
+            "-Xmx256m",
+            "-jar",
+            "Server.jar",
+        ],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    assert result.returncode not in [0, 124], "Second writer was not rejected promptly"
+    assert (
+        "WRITER_LEASE_UNAVAILABLE" in result.stderr
+    ), "Writer lease admission was not established"
+    assert (
+        native_sql(directory, "SELECT id,loggedin FROM accounts ORDER BY id;") == logins
+    )
+    assert (
+        runtime_identity(directory, "cosmic") == original
+    ), "Second writer changed the supervised game"
+    managed.doctor(directory, meta)
+    assert durable_native_signature(directory) == durable
+
+    before = require_stable_runtime(directory, meta)
+    pid = native_sql(
+        directory,
+        "SELECT ID FROM information_schema.PROCESSLIST WHERE ID=IS_USED_LOCK('card_bridge_writer') AND USER='cosmic_app' AND DB='cosmic';",
+    )
+    assert (
+        pid.isdecimal() and int(pid) > 0
+    ), "Exact managed writer connection not identified"
+    fault_at = int(time.time())
+    native_sql(directory, "KILL CONNECTION " + pid)
+    require_supervised_recovery(directory, meta, before, fault_at)
+    assert (
+        durable_native_signature(directory) == durable
+    ), "Writer lease recovery changed durable obligations"
+
+    before = require_stable_runtime(directory, meta)
+    db = runtime_identity(directory, "db")
+    fault_at = int(time.time())
+    docker_command(directory, ["restart", "--time", "10", db["id"]], timeout=30)
+    require_supervised_recovery(directory, meta, before, fault_at)
+    restored_db = runtime_identity(directory, "db")
+    assert restored_db["id"] == db["id"] and restored_db["image"] == db["image"]
+    assert (
+        durable_native_signature(directory) == durable
+    ), "Database recovery changed durable obligations"
+    print(
+        "Passed: rejected second writer and actual exit-75 supervised lease/database recovery retain native obligations"
+    )
+
+
+def qualify(directory, sandbox, expected_lines=None):
     directory, meta = managed.load(directory)
     sandbox = Path(sandbox).resolve()
     assert (
@@ -165,6 +349,18 @@ def qualify(directory, sandbox):
     managed.admin_command(
         directory, "revoke", account_id=first["accountId"], capture=True
     )
+    if expected_lines is not None:
+        active = owner.call("admin/catalog")["catalog"]
+        seeded = json.loads((directory / "private/catalog.json").read_text())
+        assert (
+            len(active["lines"]) == expected_lines
+        ), "Custom catalog lines were not activated"
+        assert {line["id"] for line in active["lines"]} == {
+            line["id"] for line in seeded["lines"]
+        }, "Active catalog replaced the supplied collection identities"
+        assert {product["id"] for product in active["products"]} == {
+            product["id"] for product in seeded["products"]
+        }, "Active catalog replaced the supplied pack identities"
     original_image = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
     )
@@ -313,18 +509,7 @@ def qualify(directory, sandbox):
         "Passed: late restore activation failure preserves a real post-exposure MySQL transaction"
     )
 
-    managed.compose(directory, "restart", "db")
-    deadline = time.monotonic() + 240
-    while True:
-        try:
-            managed.doctor(directory, meta)
-            break
-        except RuntimeError:
-            if time.monotonic() > deadline:
-                raise AssertionError(
-                    "MySQL restart did not recover game readiness"
-                ) from None
-            time.sleep(5)
+    qualify_native_runtime(directory, meta)
     owner.login("SiteOwner", password)
     collector.login("Collector", password)
     result = purchase(collector, product, 1, "qualification-after-mysql-restart")
@@ -531,5 +716,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")
     parser.add_argument("--sandbox-root", required=True)
+    parser.add_argument("--expected-lines", type=int, choices=[1, 2])
     arguments = parser.parse_args()
-    qualify(arguments.directory, arguments.sandbox_root)
+    qualify(arguments.directory, arguments.sandbox_root, arguments.expected_lines)

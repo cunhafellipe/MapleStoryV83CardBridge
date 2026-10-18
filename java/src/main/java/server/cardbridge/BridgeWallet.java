@@ -33,6 +33,27 @@ public final class BridgeWallet {
 
   public static void change(int accountId, int type, int delta) {
     String name = column(type);
+    if (BridgeHttp.enabled())
+      try {
+        BridgeHttp.requireLease();
+      } catch (SQLException lost) {
+        throw new IllegalStateException("Cash authority unavailable", lost);
+      }
+    if (delta > 0) {
+      try (Connection con = DatabaseConnection.getConnection()) {
+        con.setAutoCommit(false);
+        try {
+          BridgePayments.credit(con, accountId, type, delta);
+          con.commit();
+          return;
+        } catch (Exception error) {
+          con.rollback();
+          throw error;
+        }
+      } catch (SQLException error) {
+        throw new IllegalStateException("Cash credit unavailable", error);
+      }
+    }
     try (Connection con = DatabaseConnection.getConnection();
         PreparedStatement ps =
             con.prepareStatement(
@@ -68,21 +89,27 @@ public final class BridgeWallet {
         PreparedStatement ps =
             con.prepareStatement(
                 "SELECT COALESCE(nxCredit,0),COALESCE(maplePoint,0),COALESCE(nxPrepaid,0) FROM"
-                    + " accounts WHERE id=? AND banned=0 AND tempban<=UTC_TIMESTAMP()")) {
+                    + " accounts WHERE id=? AND banned=0 AND tempban<=UTC_TIMESTAMP() FOR"
+                    + " UPDATE")) {
+      con.setAutoCommit(false);
       ps.setInt(1, account);
       try (ResultSet rs = ps.executeQuery()) {
         if (!rs.next())
           throw new BridgeHttp.Problem(401, "ACCOUNT_UNAVAILABLE", "The account is unavailable.");
-        return Map.of(
-            "nx",
-            rs.getInt(1),
-            "acceptedCashTypes",
-            acceptedTypes(),
-            "balances",
-            List.of(
-                Map.of("cashType", 1, "name", "NX Credit", "amount", rs.getInt(1)),
-                Map.of("cashType", 2, "name", "Maple Points", "amount", rs.getInt(2)),
-                Map.of("cashType", 4, "name", "NX Prepaid", "amount", rs.getInt(3))));
+        BridgePayments.assertLiveIdentity(con, account);
+        var result =
+            Map.<String, Object>of(
+                "nx",
+                rs.getInt(1),
+                "acceptedCashTypes",
+                acceptedTypes(),
+                "balances",
+                List.of(
+                    Map.of("cashType", 1, "name", "NX Credit", "amount", rs.getInt(1)),
+                    Map.of("cashType", 2, "name", "Maple Points", "amount", rs.getInt(2)),
+                    Map.of("cashType", 4, "name", "NX Prepaid", "amount", rs.getInt(3))));
+        con.commit();
+        return result;
       }
     }
   }
@@ -100,15 +127,27 @@ public final class BridgeWallet {
     try (Connection con = DatabaseConnection.getConnection()) {
       con.setAutoCommit(false);
       try {
+        long[] account = BridgePayments.lockAccount(con, accountId, cashType);
+        String incarnation = BridgePayments.assertLiveIdentity(con, accountId);
         try (PreparedStatement ps =
             con.prepareStatement(
-                "SELECT account_id,amount,balance_after,cash_type FROM card_bridge_payments WHERE"
-                    + " order_id=? FOR UPDATE")) {
+                "SELECT account_id,amount,balance_after,cash_type,payment_state,account_incarnation"
+                    + " FROM card_bridge_payments WHERE order_id=? FOR UPDATE")) {
           ps.setString(1, orderId);
           try (ResultSet rs = ps.executeQuery()) {
             if (rs.next()) {
               if (rs.getInt(1) != accountId || rs.getInt(2) != amount || rs.getInt(4) != cashType)
                 throw new IllegalArgumentException("Payment identity conflict");
+              if (!incarnation.equals(rs.getString(6)))
+                throw new BridgeHttp.Problem(
+                    409,
+                    "LEGACY_IDENTITY_UNPROVEN",
+                    "Historical account ownership requires verified migration.");
+              if (!"LEGACY_PAID".equals(rs.getString(5)))
+                throw new BridgeHttp.Problem(
+                    409,
+                    "PAYMENT_PROTOCOL_REQUIRED",
+                    "Use the bound payment protocol for this identity.");
               var result =
                   Map.<String, Object>of(
                       "orderId",
@@ -129,6 +168,11 @@ public final class BridgeWallet {
         if (!acceptedTypes().contains(cashType))
           throw new BridgeHttp.Problem(
               400, "UNSUPPORTED_CASH_TYPE", "This cash type is not accepted.");
+        if (account[0] + BridgePayments.reserved(con, accountId, cashType) > Integer.MAX_VALUE)
+          throw new BridgeHttp.Problem(
+              409,
+              "LEGACY_RECONCILIATION_REQUIRED",
+              "Pending original-source obligations require reconciliation.");
         try (PreparedStatement ps =
             con.prepareStatement(
                 "UPDATE accounts SET "
@@ -159,13 +203,14 @@ public final class BridgeWallet {
         try (PreparedStatement ps =
             con.prepareStatement(
                 "INSERT INTO"
-                    + " card_bridge_payments(order_id,account_id,amount,balance_after,cash_type)"
-                    + " VALUES(?,?,?,?,?)")) {
+                    + " card_bridge_payments(order_id,account_id,amount,balance_after,cash_type,account_incarnation)"
+                    + " VALUES(?,?,?,?,?,?)")) {
           ps.setString(1, orderId);
           ps.setInt(2, accountId);
           ps.setInt(3, amount);
           ps.setInt(4, balance);
           ps.setInt(5, cashType);
+          ps.setString(6, incarnation);
           ps.executeUpdate();
         }
         con.commit();

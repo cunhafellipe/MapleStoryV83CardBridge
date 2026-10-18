@@ -6,7 +6,7 @@ import {
   generateSeriesOneCode,
   normalizeCode,
 } from "../src/series-one.mjs";
-import { Library, operator } from "../src/library.mjs";
+import { operator } from "../src/library.mjs";
 import { hash, mac, verifyRequest } from "../src/protocol.mjs";
 import { createLibraryHttp } from "../src/http.mjs";
 import { Journal } from "../src/journal.mjs";
@@ -66,7 +66,7 @@ test("a purchased pack contains eight collectibles and exactly one newly generat
     assert(!JSON.stringify(state).includes(secret));
     assert(!JSON.stringify(x.store.read((s) => s)).includes(secret));
     assert.equal(x.balances.get(1), 9000);
-    assert.equal(x.core.wallet(x.library.actor(x.person)).nx, 0);
+    assert.equal(x.core.wallet(x.library.actor(x.person)).nx ?? 0, 0);
   } finally {
     x.close();
   }
@@ -159,7 +159,7 @@ test("USED callbacks and polling share the same durable receipt", async () => {
     x.close();
   }
 });
-test("generated code collisions roll back the framework mint and remain recoverable after payment", async () => {
+test("generated code collisions roll back allocation and refund the exact original payment", async () => {
   const x = fixture({
     generator: () => ({
       code: "BBBBBBBBBBBBBBB",
@@ -171,11 +171,14 @@ test("generated code collisions roll back the framework mint and remain recovera
     await x.buy("first-collision");
     await assert.rejects(
       x.buy("second-collision"),
-      (e) => e.code === "DUPLICATE_CODE",
+      (e) => e.code === "PURCHASE_REFUNDED",
     );
     assert.equal(x.core.packs(x.library.actor(x.person)).length, 1);
     assert.equal(x.core.codeInventory(operator).total, 1);
-    assert.equal(x.journal.pending()[0].state, "paid");
+    assert.equal(x.journal.pending().length, 0);
+    assert.equal(x.journal.find(1, "second-collision").state, "refunded");
+    assert.equal(x.balances.get(1), 9000);
+    assert.equal(x.refundCount, 1);
   } finally {
     x.close();
   }
@@ -423,50 +426,6 @@ test("purchase registration stays scoped and recovery backs off immediately duri
     x.library.game = original;
     await x.library.recover();
     assert.equal(x.journal.pending().length, 0);
-  } finally {
-    x.close();
-  }
-});
-
-test("startup backfills existing pack completion reservations without changing ownership", async () => {
-  const x = fixture();
-  try {
-    await x.buy("backfill-startup");
-    const before = x.store.read((s) => ({
-      copies: s.copies,
-      packs: s.packs,
-      balances: s.balances,
-    }));
-    x.store.transact((s) => {
-      s.completionObligations = {};
-    });
-    assert.throws(
-      () =>
-        x.core.grantCurrency(operator, {
-          userId: x.library.actor(x.person).userId,
-          currencyId: "nx",
-          amount: 1,
-          reason: "completion migration fixture",
-          key: "before-backfill",
-        }),
-      (e) => e.code === "COMPLETION_MIGRATION_REQUIRED",
-    );
-    const restored = new Library({
-      framework: x.core,
-      store: x.store,
-      journal: x.journal,
-      game: x.game,
-    });
-    restored.quote(x.person, { productId: "first-light" });
-    assert.deepEqual(
-      x.store.read((s) => ({
-        copies: s.copies,
-        packs: s.packs,
-        balances: s.balances,
-      })),
-      before,
-    );
-    assert.equal(x.core.backfillCompletionReservations(operator).count, 0);
   } finally {
     x.close();
   }

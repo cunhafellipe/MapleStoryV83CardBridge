@@ -183,7 +183,7 @@ export function createLibraryHttp({
         const route = path.slice("/api/library/".length);
         if (
           url.search &&
-          !["admin/orders", "admin/activity", "admin/registrations"].includes(
+          !["collection", "admin/orders", "admin/activity", "admin/registrations"].includes(
             route,
           )
         )
@@ -218,6 +218,7 @@ export function createLibraryHttp({
           if (
             !ready ||
             ready.protocol !== "v83-card-bridge/1" ||
+            ready.paymentProtocol !== "cosmic-payments/1" ||
             ready.ok !== true ||
             ready.leaseReady !== true ||
             ready.callbackReady !== true ||
@@ -242,6 +243,7 @@ export function createLibraryHttp({
             ok: true,
             gameReady: true,
             callbackReady: true,
+            paymentProtocol: ready.paymentProtocol,
             authMode,
             acceptedCashTypes: library.acceptedCashTypes,
             catalogVersion: library.core.catalog().version,
@@ -352,6 +354,14 @@ export function createLibraryHttp({
           response(res, 200, await library.state(person));
           return;
         }
+        if (req.method === "GET" && route === "collection") {
+          for (const field of url.searchParams.keys())
+            if (!["after", "limit"].includes(field)) fail("INVALID_PAGE", "Unsupported collection page option.");
+          response(res, 200, library.collectionPage(person, {
+            after: url.searchParams.get("after") ?? "", limit: Number(url.searchParams.get("limit") ?? 200),
+          }));
+          return;
+        }
         if (route.startsWith("admin/")) {
           library.admin.require(person);
           if (req.method === "GET") {
@@ -424,6 +434,7 @@ export function createLibraryHttp({
         const actions = {
           codes: () => library.codePage(person, value),
           inventory: () => library.inventoryPage(person, value),
+          collection: () => library.collectionPage(person, value),
           packs: () => library.packPage(person, value),
           quote: () => library.quote(person, value),
           buy: () => library.buy(person, value),

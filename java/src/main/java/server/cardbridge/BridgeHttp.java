@@ -13,7 +13,7 @@ import java.util.concurrent.*;
 import tools.DatabaseConnection;
 
 public final class BridgeHttp {
-  public static final Gson JSON = new Gson();
+  public static final Gson JSON = new GsonBuilder().serializeNulls().create();
   private static final boolean ENABLED = "1".equals(System.getenv("CARD_BRIDGE_ENABLED"));
   private static final ConcurrentHashMap<String, Long> NONCES = new ConcurrentHashMap<>();
   private static Connection lease;
@@ -114,6 +114,10 @@ public final class BridgeHttp {
     try {
       env("CARD_BRIDGE_SHARED_KEY");
       codeKey();
+      if (config.YamlConfig.config.server.USE_MTS)
+        throw new IllegalStateException(
+            "MTS requires a qualified native inventory integration and is unsupported by this"
+                + " bridge profile");
       acquireLease();
       try (InputStream stream = BridgeHttp.class.getResourceAsStream("/card-bridge/schema.sql")) {
         if (stream == null) throw new IllegalStateException("Card bridge schema resource missing");
@@ -133,6 +137,7 @@ public final class BridgeHttp {
           }
       }
       BridgeWallet.acceptedTypes();
+      BridgePayments.initialize(lease);
       for (String[] column :
           new String[][] {
             {"attempts", "INT NOT NULL DEFAULT 0"}, {"last_attempt", "BIGINT"},
@@ -247,6 +252,14 @@ public final class BridgeHttp {
                     text(value, "tokenHash", 64));
             case "/logout" -> BridgeSessions.logout(text(value, "tokenHash", 64));
             case "/wallet" -> BridgeWallet.wallet(number(value, "accountId"));
+            case "/payment/debit" -> BridgePayments.admit(value, "debit");
+            case "/payment/cancel" -> BridgePayments.admit(value, "cancel");
+            case "/payment/adopt-legacy" -> BridgePayments.admit(value, "adopt-legacy");
+            case "/payment/attribute-legacy" -> BridgePayments.attributeLegacy(value);
+            case "/payment/status" -> BridgePayments.status(value);
+            case "/payment/pending" -> BridgePayments.pending(value);
+            case "/payment/finalize" -> BridgePayments.complete(value, false);
+            case "/payment/refund" -> BridgePayments.complete(value, true);
             case "/debit" ->
                 BridgeWallet.debit(
                     text(value, "orderId", 64),
@@ -339,6 +352,10 @@ public final class BridgeHttp {
         true,
         "protocol",
         "v83-card-bridge/1",
+        "paymentProtocol",
+        "cosmic-payments/1",
+        "legacyAttributionProtocol",
+        "cosmic-legacy-attribution/1",
         "sessionSource",
         System.getenv().getOrDefault("CARD_BRIDGE_SESSION_SOURCE", "bridge"),
         "acceptedCashTypes",

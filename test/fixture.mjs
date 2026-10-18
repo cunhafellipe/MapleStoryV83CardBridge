@@ -8,6 +8,7 @@ import { Journal } from "../src/journal.mjs";
 import { Library, operator } from "../src/library.mjs";
 import { generateSeriesOneCode } from "../src/series-one.mjs";
 import { fail } from "../src/protocol.mjs";
+import { PaymentAuthority, paymentProviderId, paymentFingerprint, paymentIntent } from "../src/payment-authority.mjs";
 export const catalog = JSON.parse(
   readFileSync(new URL("./reward-catalog.json", import.meta.url)),
 );
@@ -17,8 +18,11 @@ export function fixture({
   catalog: inputCatalog = catalog,
   generator = generateSeriesOneCode,
   acceptedCashTypes = [1, 2, 4],
+  coreOptions = {},
 } = {}) {
+  const paymentAuthority = new PaymentAuthority();
   const core = new CardFramework({
+    ...coreOptions,
     store,
     codeVault: createCodeVault({
       activeKeyId: "test",
@@ -26,6 +30,7 @@ export function fixture({
       indexKey: Buffer.alloc(32, 2),
     }),
     codeGenerators: { "series-one": generator },
+    externalPurchaseProviders: { [paymentProviderId]: paymentAuthority },
   });
   if (!store.read((s) => s.catalog))
     core.publishCatalog(operator, inputCatalog);
@@ -59,8 +64,8 @@ export function fixture({
       [2, maplePoints],
       [4, nxPrepaid],
     ]);
-  const faults = { lostDebit: false, registration: false };
-  let debitCount = 0;
+  const faults = { lostDebit: false, registration: false, lostRefund: false, lostFinalize: false };
+  let debitCount = 0, refundCount = 0;
   const game = async (path, value) => {
     if (path === "/health") {
       if (faults.health)
@@ -69,6 +74,7 @@ export function fixture({
         ok: true,
         leaseReady: true,
         protocol: "v83-card-bridge/1",
+        paymentProtocol: "cosmic-payments/1",
         callbackReady: true,
         sessionSource: faults.sessionSource ?? "bridge",
         acceptedCashTypes,
@@ -101,6 +107,74 @@ export function fixture({
           },
         ],
       };
+    if (path === "/payment/status")
+      return structuredClone(payments.get(value.transactionId) ?? { transactionId: value.transactionId, state: "UNSEEN" });
+    if (path === "/payment/pending") {
+      const rows = [...payments.values()].filter((p) => ["DEBITED", "LEGACY_PAID"].includes(p.state) &&
+        p.transactionId > (value.after ?? "")).sort((a, b) => a.transactionId.localeCompare(b.transactionId));
+      return { items: structuredClone(rows.slice(0, value.limit)), nextCursor: rows.length > value.limit ? rows[value.limit - 1].transactionId : null };
+    }
+    if (["/payment/debit", "/payment/cancel", "/payment/adopt-legacy"].includes(path)) {
+      const id = value.intent.transactionId, amount = Number(value.intent.externalUnits),
+        balance = wallets.get(value.cashType), old = payments.get(id);
+      if (old && old.state !== "LEGACY_PAID") {
+        if (paymentFingerprint(old.intent) !== value.fingerprint || old.accountId !== value.accountId || old.cashType !== value.cashType)
+          fail("PAYMENT_CONFLICT", "Changed payment");
+        if (path === "/payment/cancel" && old.state !== "CANCELLED") fail("PAYMENT_TERMINAL_CONFLICT", "Already debited");
+        return structuredClone(old);
+      }
+      if (path === "/payment/adopt-legacy" && !old) fail("NOT_FOUND", "Original debit missing", 404);
+      const cancelled = path === "/payment/cancel" || !acceptedCashTypes.includes(value.cashType) || balance.get(value.accountId) < amount;
+      if (!cancelled && !old) {
+        balance.set(value.accountId, balance.get(value.accountId) - amount);
+        debitCount++;
+      }
+      const kind = cancelled ? "no_debit" : "debit";
+      const proof = {
+        kind, reference: `${kind}:${id}`, providerId: paymentProviderId,
+        transactionId: id, userId: value.intent.userId,
+        externalCurrency: value.intent.externalCurrency,
+        externalUnits: value.intent.externalUnits, fingerprint: value.fingerprint,
+      };
+      const receipt = {
+        transactionId: id, accountId: value.accountId, cashType: value.cashType, amount,
+        balance: balance.get(value.accountId), state: cancelled ? "CANCELLED" : "DEBITED",
+        accountIncarnation: `00000000-0000-4000-8000-${String(value.accountId).padStart(12, "0")}`,
+        intent: structuredClone(value.intent), fingerprint: value.fingerprint,
+        preparationId: value.preparationId, headroomReserved: !cancelled, owedAmount: "0",
+        [cancelled ? "noDebitReceipt" : "debitReceipt"]: proof,
+        ...(cancelled ? { cancellationReason: "INSUFFICIENT_FUNDS" } : {}),
+      };
+      payments.set(id, receipt);
+      if (faults.lostDebit && !cancelled) {
+        faults.lostDebit = false;
+        fail("GAME_UNAVAILABLE", "Payment response lost", 503);
+      }
+      return structuredClone(receipt);
+    }
+    if (["/payment/finalize", "/payment/refund"].includes(path)) {
+      const row = payments.get(value.transactionId);
+      if (!row || row.fingerprint !== value.fingerprint) fail("PAYMENT_CONFLICT", "Changed payment");
+      const refund = path === "/payment/refund", state = refund ? "REFUNDED" : "FULFILLED";
+      if (!["DEBITED", state].includes(row.state)) fail("PAYMENT_TERMINAL_CONFLICT", "Already settled");
+      const field = refund ? "compensationId" : "purchaseId";
+      if (row.state === state && row[field] !== value[field]) fail("PAYMENT_CONFLICT", "Changed outcome");
+      if (refund && row.state === "DEBITED") {
+        if (faults.refundOwed) {
+          row.owedAmount = String(row.amount); row.headroomReserved = false;
+          return structuredClone(row);
+        }
+        const balance = wallets.get(row.cashType);
+        balance.set(row.accountId, balance.get(row.accountId) + row.amount);
+        refundCount++;
+        row.refundReceipt = { ...row.debitReceipt, kind: "refund", reference: `refund:${row.transactionId}`,
+          compensationId: value.compensationId, debitReference: value.debitReference };
+      }
+      row.state = state; row[field] = value[field]; row.headroomReserved = false; row.owedAmount = "0";
+      const fault = refund ? "lostRefund" : "lostFinalize";
+      if (faults[fault]) { faults[fault] = false; fail("GAME_UNAVAILABLE", "Completion response lost", 503); }
+      return structuredClone(row);
+    }
     if (path === "/debit") {
       if (payments.has(value.orderId)) {
         const old = payments.get(value.orderId);
@@ -153,6 +227,7 @@ export function fixture({
       journal,
       game,
       acceptedCashTypes,
+      paymentAuthority,
     }),
     person = { accountId: 1, name: "Collector" },
     other = { accountId: 2, name: "OtherCollector" };
@@ -179,6 +254,7 @@ export function fixture({
     get debitCount() {
       return debitCount;
     },
+    get refundCount() { return refundCount; },
     close() {
       journal.close();
       core.close();

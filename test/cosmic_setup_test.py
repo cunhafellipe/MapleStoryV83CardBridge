@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from argparse import Namespace
+from contextlib import closing
 
 spec = importlib.util.spec_from_file_location(
     "cosmic_setup", Path(__file__).parents[1] / "tools/cosmic.py"
@@ -19,56 +20,60 @@ spec.loader.exec_module(setup)
 
 
 class SetupSafety(unittest.TestCase):
+    def state_pair(self, root, normalized):
+        framework = sqlite3.connect(root / "framework.sqlite")
+        framework.execute("PRAGMA journal_mode=WAL")
+        if normalized:
+            storage_version = normalized if type(normalized) is int else 2
+            framework.executescript(setup.normalized_schema_sql(storage_version))
+            marker = (
+                json.dumps(
+                    {
+                        "format": "digital-card.indexed-state",
+                        "version": storage_version,
+                        "recordKeys": "blind-v1",
+                    }
+                )
+                if storage_version >= 3
+                else "opaque-fixture"
+            )
+            framework.execute(
+                "INSERT INTO framework_meta VALUES(1,?,?)", (storage_version, marker)
+            )
+            framework.execute("PRAGMA user_version=" + str(storage_version))
+        else:
+            framework.executescript(
+                "CREATE TABLE framework_state(id INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL,body TEXT NOT NULL); INSERT INTO framework_state VALUES(1,1,'opaque-fixture');"
+            )
+        framework.commit()
+        framework.close()
+        bridge = sqlite3.connect(root / "bridge.sqlite")
+        bridge.executescript(
+            "PRAGMA journal_mode=WAL; CREATE TABLE orders(id TEXT PRIMARY KEY,state TEXT,body TEXT); CREATE TABLE registrations(code_id TEXT PRIMARY KEY);"
+        )
+        if normalized:
+            bridge.executescript(
+                "CREATE TABLE payment_discovery(id TEXT PRIMARY KEY,source TEXT,first_seen TEXT,checked_at TEXT); PRAGMA user_version=2;"
+            )
+        bridge.close()
+
     @unittest.skipUnless(
         setup.shutil.which("node"), "Requires Node.js with node:sqlite"
     )
-    def test_recovery_validation_copies_closed_and_wal_only_schema_without_source_writes(
+    def test_recovery_copy_probe_accepts_known_schemas_preserves_wal_and_rejects_future(
         self,
     ):
-        for active in [False, True]:
+        for normalized in [False, True, 3, 4, 5, 6, 7, 8]:
             with self.subTest(
-                active=active
+                normalized=normalized
             ), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 state, work = root / "state", root / "work"
                 state.mkdir()
                 work.mkdir()
-                writers = []
-                try:
-                    for file, table in [
-                        ("framework.sqlite", "framework_state"),
-                        ("bridge.sqlite", "orders"),
-                    ]:
-                        writer = sqlite3.connect(state / file)
-                        writer.execute("PRAGMA journal_mode=WAL")
-                        writer.execute("PRAGMA wal_autocheckpoint=0")
-                        writer.execute("CREATE TABLE checkpointed(id INTEGER)")
-                        writer.commit()
-                        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        if table == "framework_state":
-                            writer.execute("CREATE TABLE framework_state(id INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL,body TEXT NOT NULL)")
-                            writer.execute("INSERT INTO framework_state VALUES(1,1,'opaque-fixture')")
-                        else:
-                            writer.execute("CREATE TABLE orders(id INTEGER)")
-                            writer.execute("CREATE TABLE registrations(code_id TEXT)")
-                            writer.execute("INSERT INTO orders VALUES(1)")
-                        writer.commit()
-                        if active:
-                            writers.append(writer)
-                            primary = sqlite3.connect(
-                                (state / file).as_uri() + "?immutable=1", uri=True
-                            )
-                            try:
-                                self.assertIsNone(
-                                    primary.execute(
-                                        "SELECT 1 FROM sqlite_master WHERE name=?",
-                                        (table,),
-                                    ).fetchone()
-                                )
-                            finally:
-                                primary.close()
-                        else:
-                            writer.close()
+                self.state_pair(state, normalized)
+
+                def probe(ok):
                     before = {p.name: setup.file_hash(p) for p in state.iterdir()}
                     result = setup.subprocess.run(
                         [
@@ -82,40 +87,554 @@ class SetupSafety(unittest.TestCase):
                         capture_output=True,
                         text=True,
                     )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(json.loads(result.stdout), {"ok": True})
+                    self.assertEqual(result.returncode == 0, ok, result.stderr)
                     self.assertEqual(
                         before, {p.name: setup.file_hash(p) for p in state.iterdir()}
                     )
                     self.assertEqual(list(work.iterdir()), [])
-                    if not active:
-                        (state / "bridge.sqlite").write_bytes(b"invalid SQLite fixture")
-                        before = {p.name: setup.file_hash(p) for p in state.iterdir()}
-                        result = setup.subprocess.run(
-                            [
-                                setup.shutil.which("node"),
-                                "--input-type=module",
-                                "-e",
-                                setup.recovery_state_probe_script(),
-                                str(state),
-                                str(work),
-                            ],
-                            capture_output=True,
-                            text=True,
-                        )
-                        self.assertNotEqual(result.returncode, 0)
-                        self.assertEqual(
-                            json.loads(result.stderr),
-                            {"code": "RECOVERY_BRIDGE_UNAVAILABLE"},
-                        )
-                        self.assertEqual(
-                            before,
-                            {p.name: setup.file_hash(p) for p in state.iterdir()},
-                        )
-                        self.assertEqual(list(work.iterdir()), [])
+
+                for name in ["framework.sqlite", "bridge.sqlite"]:
+                    with closing(sqlite3.connect(state / name)) as con:
+                        setup.validate_database_schema(con, name == "framework.sqlite")
+                probe(True)
+                writer = sqlite3.connect(state / "bridge.sqlite")
+                try:
+                    writer.execute("PRAGMA wal_autocheckpoint=0")
+                    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    writer.execute("PRAGMA user_version=3")
+                    writer.commit()
+                    self.assertGreater(
+                        Path(str(state / "bridge.sqlite") + "-wal").stat().st_size, 0
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "unsupported"):
+                        setup.validate_database_schema(writer, False)
+                    probe(False)
                 finally:
-                    for writer in writers:
-                        writer.close()
+                    writer.close()
+
+    @unittest.skipUnless(
+        setup.shutil.which("node"), "Requires Node.js with node:sqlite"
+    )
+    def test_legacy_schema_rejects_extra_indexes_and_mistyped_columns(self):
+        for mutation in [
+            "CREATE INDEX framework_legacy_extra ON framework_state(schema_version)",
+            "DROP TABLE framework_state; CREATE TABLE framework_state(id TEXT PRIMARY KEY,schema_version INTEGER,body TEXT); INSERT INTO framework_state VALUES('1',1,'opaque')",
+        ]:
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state, work = root / "state", root / "work"
+                state.mkdir()
+                work.mkdir()
+                self.state_pair(state, False)
+                with closing(sqlite3.connect(state / "framework.sqlite")) as con:
+                    con.executescript(mutation)
+                    with self.assertRaises(RuntimeError):
+                        setup.validate_database_schema(con, True)
+                result = setup.subprocess.run(
+                    [
+                        setup.shutil.which("node"),
+                        "--input-type=module",
+                        "-e",
+                        setup.recovery_state_probe_script(),
+                        str(state),
+                        str(work),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(list(work.iterdir()), [])
+
+    def test_backup_schema_rejects_future_mixed_and_incomplete_normalized_state(self):
+        for mutation in [
+            "PRAGMA user_version=3",
+            "UPDATE framework_meta SET schema_version=3",
+            "CREATE TABLE framework_state(id INTEGER,schema_version INTEGER,body TEXT)",
+            "DROP INDEX framework_owner",
+            "UPDATE framework_meta SET codec_check=''",
+            "DROP TABLE framework_entities",
+        ]:
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.state_pair(root, True)
+                with closing(sqlite3.connect(root / "framework.sqlite")) as con:
+                    con.executescript(mutation)
+                    with self.assertRaises((RuntimeError, sqlite3.Error)):
+                        setup.validate_database_schema(con, True)
+
+    @unittest.skipUnless(
+        setup.shutil.which("node"), "Requires Node.js with node:sqlite"
+    )
+    def test_schema_three_rejects_holder_layout_foreign_keys_and_marker_tampering(self):
+        mutations = [
+            "PRAGMA user_version=4",
+            "UPDATE framework_meta SET schema_version=2",
+            "UPDATE framework_meta SET codec_check='{}'",
+            "DROP INDEX framework_code_membership",
+            "DROP INDEX framework_code_membership; CREATE INDEX framework_code_membership ON framework_code_holders(copy_id)",
+            "DROP TABLE framework_code_holders; CREATE TABLE framework_code_holders(collection TEXT,code_id TEXT,holder_hash TEXT,copy_id TEXT)",
+            "INSERT INTO framework_code_holders VALUES('codes','missing-code','blind-holder','copy-id')",
+            "CREATE TABLE framework_extra(id INTEGER)",
+            "CREATE TABLE framework_state(id INTEGER,schema_version INTEGER,body TEXT)",
+        ]
+        for mutation in mutations:
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state, work = root / "state", root / "work"
+                state.mkdir()
+                work.mkdir()
+                self.state_pair(state, 3)
+                with closing(sqlite3.connect(state / "framework.sqlite")) as con:
+                    con.executescript(mutation)
+                    with self.assertRaises((RuntimeError, sqlite3.Error)):
+                        setup.validate_database_schema(con, True)
+                before = {p.name: setup.file_hash(p) for p in state.iterdir()}
+                result = setup.subprocess.run(
+                    [
+                        setup.shutil.which("node"),
+                        "--input-type=module",
+                        "-e",
+                        setup.recovery_state_probe_script(),
+                        str(state),
+                        str(work),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    before, {p.name: setup.file_hash(p) for p in state.iterdir()}
+                )
+                self.assertEqual(list(work.iterdir()), [])
+
+    def test_schema_eight_rejects_unknown_versions_indexes_and_work_relationships(self):
+        for mutation in [
+            "PRAGMA user_version=99",
+            "UPDATE framework_meta SET schema_version=7",
+            "DROP INDEX framework_code_prefix_expiry",
+            "DROP INDEX framework_code_order_unique",
+            "DROP INDEX framework_owner_card_state",
+            "DROP INDEX framework_action_due",
+            "DROP TABLE framework_expiration_work",
+            "UPDATE framework_meta SET codec_check='{}'",
+            "INSERT INTO framework_action_work VALUES('actionJobs','missing-job',1,0,NULL,1)",
+        ]:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.state_pair(root, 8)
+                with closing(sqlite3.connect(root / "framework.sqlite")) as con:
+                    setup.validate_database_schema(con, True)
+                    con.executescript(mutation)
+                    with self.assertRaises((RuntimeError, sqlite3.Error)):
+                        setup.validate_database_schema(con, True)
+
+    @unittest.skipUnless(
+        setup.shutil.which("node"), "Requires Node.js with node:sqlite"
+    )
+    def test_current_encrypted_schema_authenticates_and_wrong_key_preserves_source(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state, work = root / "state", root / "work"
+            state.mkdir()
+            work.mkdir()
+            create = "import{SQLiteStore}from'@digital-card/framework/sqlite';import{Journal}from'./src/journal.mjs';const root=process.argv[1];const store=new SQLiteStore(root+'/framework.sqlite',{encryptionKey:Buffer.alloc(32,7)});if(store.diagnostics().storageSchema!==8)throw Error('EXPECTED_SCHEMA_8');store.close();const journal=new Journal(root+'/bridge.sqlite');journal.close();"
+            result = setup.subprocess.run(
+                [
+                    setup.shutil.which("node"),
+                    "--input-type=module",
+                    "-e",
+                    create,
+                    str(state),
+                ],
+                cwd=setup.ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            before = {p.name: setup.file_hash(p) for p in state.iterdir()}
+            inspected = work / "archive-framework.sqlite"
+            setup.shutil.copyfile(state / "framework.sqlite", inspected)
+            with closing(sqlite3.connect(inspected)) as con:
+                setup.validate_database_schema(con, True)
+            for member in work.iterdir():
+                member.unlink()
+            probe = setup.subprocess.run(
+                [
+                    setup.shutil.which("node"),
+                    "--input-type=module",
+                    "-e",
+                    setup.recovery_state_probe_script(require_normalized=True),
+                    str(state),
+                    str(work),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            authenticate = "import{SQLiteStore}from'@digital-card/framework/sqlite';const path=process.argv[1];let accepted=false;try{new SQLiteStore(path,{encryptionKey:Buffer.alloc(32,9),readOnly:true});accepted=true}catch{}if(accepted)throw Error('WRONG_KEY_ACCEPTED');"
+            result = setup.subprocess.run(
+                [
+                    setup.shutil.which("node"),
+                    "--input-type=module",
+                    "-e",
+                    authenticate,
+                    str(state / "framework.sqlite"),
+                ],
+                cwd=setup.ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                before, {p.name: setup.file_hash(p) for p in state.iterdir()}
+            )
+            self.assertEqual(list(work.iterdir()), [])
+            authenticate_copy = "import{SQLiteStore}from'@digital-card/framework/sqlite';import{copyFileSync,mkdtempSync,rmSync}from'node:fs';import{join}from'node:path';const root=mkdtempSync(join(process.argv[2],'authenticate-'));try{copyFileSync(process.argv[1],join(root,'framework.sqlite'));const store=new SQLiteStore(join(root,'framework.sqlite'),{encryptionKey:Buffer.alloc(32,7),readOnly:true});store.close()}finally{rmSync(root,{recursive:true,force:true})}"
+            result = setup.subprocess.run(
+                [
+                    setup.shutil.which("node"),
+                    "--input-type=module",
+                    "-e",
+                    authenticate_copy,
+                    str(state / "framework.sqlite"),
+                    str(work),
+                ],
+                cwd=setup.ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                before, {p.name: setup.file_hash(p) for p in state.iterdir()}
+            )
+            self.assertEqual(list(work.iterdir()), [])
+
+    @unittest.skipUnless(
+        setup.shutil.which("node"), "Requires Node.js with node:sqlite"
+    )
+    def test_legacy_source_probe_rejects_normalized_or_new_financial_orders(self):
+        for normalized, modern in [(False, False), (False, True), (True, False)]:
+            with self.subTest(
+                normalized=normalized, modern=modern
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state, work = root / "state", root / "work"
+                state.mkdir()
+                work.mkdir()
+                self.state_pair(state, normalized)
+                with closing(sqlite3.connect(state / "bridge.sqlite")) as con:
+                    con.execute(
+                        "INSERT INTO orders VALUES(?,?,?)",
+                        (
+                            "legacy",
+                            "paid",
+                            json.dumps(
+                                {"financialVersion": 1} if modern else {"id": "legacy"}
+                            ),
+                        ),
+                    )
+                    con.commit()
+                before = {p.name: setup.file_hash(p) for p in state.iterdir()}
+                result = setup.subprocess.run(
+                    [
+                        setup.shutil.which("node"),
+                        "--input-type=module",
+                        "-e",
+                        setup.recovery_state_probe_script(require_legacy=True),
+                        str(state),
+                        str(work),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    result.returncode == 0, not normalized and not modern, result.stderr
+                )
+                self.assertEqual(
+                    before, {p.name: setup.file_hash(p) for p in state.iterdir()}
+                )
+                self.assertEqual(list(work.iterdir()), [])
+
+    def migration_fixture(self, root):
+        installation, safety = root / "installation", root / "backup"
+        installation.mkdir()
+        original = self.backup_fixture(safety, installation)
+        for name in [
+            "compose.json",
+            "installation.json",
+            "images.lock.json",
+            "private/cards.env",
+            "private/game.env",
+            "private/database.env",
+            "private/config.yaml",
+            "private/catalog.json",
+        ]:
+            setup.private_file(installation / name, (safety / name).read_bytes())
+        for name, data in [
+            ("private/cards.env", "ENABLE_SERIES_ONE_REWARDS=0\nASSET_ROOT=/assets\n"),
+            ("private/catalog.json", json.dumps(setup.managed_catalog())),
+        ]:
+            setup.private_file(installation / name, data)
+            setup.private_file(safety / name, data)
+        self.checksum_fixture(safety)
+        meta = {**original, "bridgeHash": "e" * 64, "seriesOneEnabled": False}
+        locks = json.loads((safety / "images.lock.json").read_text())
+        locks["node"] = "public.example/node@sha256:" + "f" * 64
+        candidate = setup.create_compose(meta, locks)
+        marker = {
+            "format": 1,
+            "phase": "staging",
+            "oldMeta": original,
+            "meta": meta,
+            "candidateLocks": locks,
+            "candidate": candidate,
+            "backup": str(safety),
+            "backupDigest": setup.file_hash(safety / "checksums.json"),
+            "oldBinding": setup.migration_binding(installation),
+            "runtimeImages": {
+                candidate["services"][name]["image"]: "sha256:" + "d" * 64
+                for name in ["cards", "cosmic"]
+            },
+        }
+        values = setup.migration_staging_bytes(marker, safety)
+        marker["newBinding"] = {
+            name: setup.hashlib.sha256(value).hexdigest()
+            for name, value in values.items()
+        }
+        setup.write_migration(installation, marker)
+        return installation, original, meta, marker, safety
+
+    def attribution_fixture(self, root):
+        installation, original, meta, marker, safety = self.migration_fixture(root)
+        retained = installation / "backups" / "original"
+        retained.parent.mkdir()
+        setup.shutil.move(str(safety), str(retained))
+        marker.update(kind="legacy", backup=str(retained))
+        setup.write_migration(installation, marker)
+        marker = setup.stage_legacy_migration(installation, marker, retained)
+        return installation, meta, marker, retained
+
+    def test_managed_attribution_keeps_writers_stopped_and_uses_bound_readonly_inputs(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            installation, meta, marker, safety = self.attribution_fixture(
+                Path(directory).resolve()
+            )
+            before = setup.migration_binding(installation)
+            marker_hash = setup.file_hash(installation / "migration.pending.json")
+            calls = []
+
+            def compose(path, *args, **kwargs):
+                calls.append(args)
+                return "c" * 64 if args == ("ps", "-q", "network") else ""
+
+            expected = {
+                "orderId": "a" * 64,
+                "decisionKey": "attribution-001",
+                "state": "attributed",
+                "evidenceFingerprint": "b" * 64,
+            }
+            with patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(setup, "no_players") as players, patch.object(
+                setup, "compose", side_effect=compose
+            ), patch.object(
+                setup, "run", return_value=json.dumps(expected)
+            ) as run, patch.object(
+                setup, "start"
+            ) as start, patch.object(
+                setup, "finish_legacy_migration"
+            ) as finish, patch.object(
+                setup, "restore_data"
+            ) as restore, patch(
+                "sys.stdout", io.StringIO()
+            ):
+                result = setup.attribute_legacy_payment(
+                    installation,
+                    meta,
+                    "a" * 64,
+                    "attribution-001",
+                    "maintenance-operator",
+                    "Verify original retained account",
+                )
+                self.assertEqual(result, expected)
+                self.assertEqual(players.call_count, 2)
+                start.assert_not_called()
+                finish.assert_not_called()
+                restore.assert_not_called()
+            command = run.call_args.args[0]
+            for option, value in [
+                ("--network", "container:" + "c" * 64),
+                ("--user", "0:0"),
+                ("--cap-drop", "ALL"),
+                ("--cap-add", "DAC_READ_SEARCH"),
+                ("--security-opt", "no-new-privileges"),
+                ("--tmpfs", "/tmp:rw,noexec,nosuid,size=272m"),
+                ("--env-file", str(installation / "private/cards.env")),
+            ]:
+                self.assertEqual(command[command.index(option) + 1], value)
+            self.assertIn("--read-only", command)
+            mounts = [
+                command[i + 1] for i, value in enumerate(command) if value == "--mount"
+            ]
+            self.assertEqual(
+                mounts,
+                [
+                    "type=bind,source="
+                    + str(installation)
+                    + ",target="
+                    + str(installation)
+                    + ",readonly",
+                    "type=bind,source="
+                    + str(safety)
+                    + ",target="
+                    + str(safety)
+                    + ",readonly",
+                    "type=volume,source="
+                    + meta["project"]
+                    + "_card_state,target=/opt/card/state,readonly",
+                ],
+            )
+            tail = command[command.index("tools/payments.mjs") :]
+            self.assertEqual(
+                tail,
+                [
+                    "tools/payments.mjs",
+                    "attribute-legacy",
+                    "--deployment-directory",
+                    str(installation),
+                    "--order-id",
+                    "a" * 64,
+                    "--decision-key",
+                    "attribution-001",
+                    "--operator-id",
+                    "maintenance-operator",
+                    "--reason",
+                    "Verify original retained account",
+                    "--confirm-bridge-stopped",
+                ],
+            )
+            self.assertTrue(run.call_args.kwargs["structured_error"])
+            self.assertFalse(any(args[0] in ["up", "start"] for args in calls))
+            self.assertEqual(before, setup.migration_binding(installation))
+            self.assertEqual(
+                marker_hash, setup.file_hash(installation / "migration.pending.json")
+            )
+
+    def test_managed_attribution_rejects_fences_and_unbound_ingress_before_stopping(
+        self,
+    ):
+        cases = [
+            "ordinary",
+            "setup",
+            "recovery",
+            "staging",
+            "activating",
+            "open",
+            "binding",
+            "backup",
+        ]
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                installation, meta, marker, safety = self.attribution_fixture(
+                    Path(directory).resolve()
+                )
+                if case in ["ordinary", "setup", "recovery"]:
+                    setup.private_file(
+                        installation
+                        / {
+                            "ordinary": "upgrade.pending.json",
+                            "setup": "setup.pending.json",
+                            "recovery": "recovery.pending.json",
+                        }[case],
+                        "{}",
+                    )
+                elif case in ["staging", "activating"]:
+                    setup.write_migration(installation, marker, case)
+                elif case == "open":
+                    setup.private_file(
+                        installation / "compose.json", json.dumps(marker["candidate"])
+                    )
+                elif case == "binding":
+                    setup.private_file(installation / "private/cards.env", "changed")
+                elif case == "backup":
+                    setup.private_file(
+                        safety / "database.sql", "corrupted retained snapshot"
+                    )
+                with patch.object(
+                    setup, "migration_images", return_value=marker["runtimeImages"]
+                ), patch.object(setup, "compose") as compose, patch.object(
+                    setup, "run"
+                ) as run:
+                    with self.assertRaises(RuntimeError):
+                        setup.attribute_legacy_payment(
+                            installation,
+                            meta,
+                            "a" * 64,
+                            "attribution-001",
+                            "operator",
+                            "Verify account",
+                        )
+                    compose.assert_not_called()
+                    run.assert_not_called()
+
+    def test_managed_attribution_rejects_invalid_terms_before_maintenance_and_live_writers(
+        self,
+    ):
+        invalid = [
+            ("A" * 64, "attribution-001", "operator", "Reason"),
+            ("a" * 64, "short", "operator", "Reason"),
+            ("a" * 64, "attribution-001", " ", "Reason"),
+            ("a" * 64, "attribution-001", "operator", "bad\nreason"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            installation, meta, marker, safety = self.attribution_fixture(
+                Path(directory).resolve()
+            )
+            with patch.object(setup, "compose") as compose, patch.object(
+                setup, "run"
+            ) as run:
+                for terms in invalid:
+                    with self.assertRaises(ValueError):
+                        setup.attribute_legacy_payment(installation, meta, *terms)
+                compose.assert_not_called()
+                run.assert_not_called()
+
+            def compose(path, *args, **kwargs):
+                return (
+                    "still-running"
+                    if args == ("ps", "--status", "running", "-q", "cards")
+                    else ""
+                )
+
+            with patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(setup, "no_players"), patch.object(
+                setup, "compose", side_effect=compose
+            ), patch.object(
+                setup, "run"
+            ) as run:
+                with self.assertRaisesRegex(
+                    RuntimeError, "writers must remain stopped"
+                ):
+                    setup.attribute_legacy_payment(
+                        installation,
+                        meta,
+                        "a" * 64,
+                        "attribution-001",
+                        "operator",
+                        "Reason",
+                    )
+                run.assert_not_called()
 
     def test_recovery_validation_failure_reports_safe_category_and_preserves_current_data(
         self,
@@ -162,6 +681,334 @@ class SetupSafety(unittest.TestCase):
                 "activating",
             )
 
+    def test_managed_attribution_failure_preserves_fence_and_exact_retry_terms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installation, meta, marker, safety = self.attribution_fixture(
+                Path(directory).resolve()
+            )
+            attempts = []
+
+            def compose(path, *args, **kwargs):
+                return "c" * 64 if args == ("ps", "-q", "network") else ""
+
+            def run(command, **kwargs):
+                attempts.append(command)
+                if len(attempts) == 1:
+                    raise setup.CommandError(
+                        "Suppressed private diagnostic", "LEGACY_EVIDENCE_REJECTED"
+                    )
+                return json.dumps(
+                    {
+                        "orderId": "a" * 64,
+                        "decisionKey": "attribution-001",
+                        "state": "attributed",
+                        "evidenceFingerprint": "b" * 64,
+                    }
+                )
+
+            with patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(setup, "no_players"), patch.object(
+                setup, "compose", side_effect=compose
+            ), patch.object(
+                setup, "run", side_effect=run
+            ), patch.object(
+                setup, "start"
+            ) as start, patch(
+                "sys.stdout", io.StringIO()
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "LEGACY_EVIDENCE_REJECTED"
+                ) as error:
+                    setup.attribute_legacy_payment(
+                        installation,
+                        meta,
+                        "a" * 64,
+                        "attribution-001",
+                        "operator",
+                        "Verify account",
+                    )
+                self.assertNotIn("Suppressed private", str(error.exception))
+                self.assertTrue((installation / "migration.pending.json").exists())
+                setup.attribute_legacy_payment(
+                    installation,
+                    meta,
+                    "a" * 64,
+                    "attribution-001",
+                    "operator",
+                    "Verify account",
+                )
+                start.assert_not_called()
+            self.assertEqual(attempts[0], attempts[1])
+            self.assertFalse(
+                json.loads((installation / "compose.json").read_text())["services"][
+                    "network"
+                ]["ports"]
+            )
+
+    def test_migration_staging_retries_each_old_new_identity_without_losing_fence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            installation, original, meta, marker, safety = self.migration_fixture(root)
+            atomic = setup.atomic_migration_file
+
+            def fail_lock(path, data):
+                if path.name == "images.lock.json":
+                    raise RuntimeError("staging write unavailable")
+                return atomic(path, data)
+
+            with patch.object(setup, "atomic_migration_file", side_effect=fail_lock):
+                with self.assertRaisesRegex(RuntimeError, "staging write"):
+                    setup.stage_legacy_migration(installation, marker, safety)
+            self.assertEqual(
+                json.loads((installation / "installation.json").read_text()), meta
+            )
+            self.assertEqual(
+                json.loads((installation / "migration.pending.json").read_text())[
+                    "phase"
+                ],
+                "staging",
+            )
+            with self.assertRaisesRegex(RuntimeError, "remains closed"):
+                setup.start(installation, meta)
+            resumed = setup.stage_legacy_migration(installation, marker, safety)
+            self.assertEqual(resumed["phase"], "migrating")
+            self.assertEqual(resumed["binding"], marker["newBinding"])
+            self.assertEqual(
+                setup.migration_binding(installation), marker["newBinding"]
+            )
+            self.assertEqual(
+                json.loads((installation / "compose.json").read_text())["services"][
+                    "network"
+                ]["ports"],
+                [],
+            )
+            self.assertEqual(
+                setup.file_hash(safety / "checksums.json"), marker["backupDigest"]
+            )
+            self.assertEqual(list(installation.rglob("*.migration-*")), [])
+
+    def test_only_explicit_legacy_upgrade_admits_unresolved_backup_and_preserves_old_locks(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            installation, original, meta, marker, safety = self.migration_fixture(root)
+            (installation / "migration.pending.json").unlink()
+            setup.private_file(installation / "cosmic/pom.xml", "fixture")
+            setup.private_file(
+                installation / "cosmic/config.yaml",
+                "DB_USER: app\nDB_PASS: fixture\nHOST: 127.0.0.1\nLANHOST: 127.0.0.1\nLOCALHOST: 127.0.0.1\n",
+            )
+            old_locks = (installation / "images.lock.json").read_bytes()
+            with patch.object(setup, "no_players"), patch.object(
+                setup, "compose", return_value="1"
+            ), patch.object(setup, "backup") as backup, patch.object(
+                setup, "bridge_snapshot"
+            ) as snapshot:
+                with self.assertRaisesRegex(RuntimeError, "Finish pending purchases"):
+                    setup.upgrade(installation, original)
+                backup.assert_not_called()
+                snapshot.assert_not_called()
+
+            def locks(path):
+                setup.private_file(
+                    path / "images.lock.json", json.dumps(marker["candidateLocks"])
+                )
+                return marker["candidateLocks"]
+
+            def backup(path, saved, **kwargs):
+                self.assertFalse(kwargs["require_resolved"])
+                self.assertTrue(kwargs["require_legacy"])
+                self.assertEqual((path / "images.lock.json").read_bytes(), old_locks)
+                self.assertEqual(
+                    json.loads((path / "compose.json").read_text()),
+                    json.loads((safety / "compose.json").read_text()),
+                )
+                return safety
+
+            with patch.object(setup, "no_players"), patch.object(
+                setup, "compose", return_value="1"
+            ), patch.object(setup, "run"), patch.object(
+                setup, "bridge_snapshot", return_value="e" * 64
+            ), patch.object(
+                setup, "lock_images", side_effect=locks
+            ), patch.object(
+                setup, "backup", side_effect=backup
+            ), patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(
+                setup,
+                "finish_legacy_migration",
+                side_effect=RuntimeError("candidate paused"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "candidate paused"):
+                    setup.upgrade(installation, original, migrate_legacy=True)
+            pending = json.loads((installation / "migration.pending.json").read_text())
+            self.assertEqual(pending["phase"], "staging")
+            self.assertEqual(pending["oldMeta"], original)
+            self.assertEqual(
+                json.loads((installation / "installation.json").read_text()), original
+            )
+            self.assertEqual(
+                (installation / "images.lock.json").read_bytes(), old_locks
+            )
+            with self.assertRaisesRegex(RuntimeError, "remains closed"):
+                setup.start(installation, original)
+
+    def test_migration_compose_publication_is_atomic_after_phase_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            installation, original, meta, marker, safety = self.migration_fixture(root)
+            marker = setup.stage_legacy_migration(installation, marker, safety)
+            before = (installation / "compose.json").read_bytes()
+            replace = setup.os.replace
+
+            def fail_compose(source, destination):
+                if Path(destination).name == "compose.json":
+                    Path(source).write_text("{")
+                    raise OSError("atomic publication unavailable")
+                return replace(source, destination)
+
+            with patch.object(setup, "no_players"), patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(setup.os, "replace", side_effect=fail_compose):
+                with self.assertRaisesRegex(OSError, "atomic publication"):
+                    setup.finish_legacy_migration(installation, meta)
+            self.assertEqual((installation / "compose.json").read_bytes(), before)
+            self.assertEqual(
+                json.loads((installation / "migration.pending.json").read_text())[
+                    "phase"
+                ],
+                "validating",
+            )
+            self.assertEqual(list(installation.rglob("*.migration-*")), [])
+            with self.assertRaisesRegex(RuntimeError, "remains closed"):
+                setup.start(installation, meta)
+
+    def test_migration_pending_and_late_activation_never_restore_current_data(self):
+        for pending, late in [(True, False), (False, True)]:
+            with self.subTest(
+                pending=pending, late=late
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                installation, original, meta, marker, safety = self.migration_fixture(
+                    root
+                )
+                observed = []
+
+                def start(path, saved, **kwargs):
+                    ports = json.loads((path / "compose.json").read_text())["services"][
+                        "network"
+                    ]["ports"]
+                    observed.append(ports)
+                    if ports and late:
+                        (root / "post-exposure-receipt").write_text("retained")
+                        raise RuntimeError("activation unavailable")
+
+                with patch.object(setup, "no_players"), patch.object(
+                    setup, "migration_images", return_value=marker["runtimeImages"]
+                ), patch.object(
+                    setup, "compose", return_value="namespace"
+                ), patch.object(
+                    setup, "recreate_namespace"
+                ), patch.object(
+                    setup, "stopped_state_probe", return_value='{"ok":true}'
+                ), patch.object(
+                    setup, "stopped_state_probe_after_stop", return_value="0"
+                ), patch.object(
+                    setup,
+                    "payment_closure",
+                    return_value={"ok": True, "clear": not pending},
+                ), patch.object(
+                    setup, "start", side_effect=start
+                ), patch.object(
+                    setup, "restore_data"
+                ) as restore:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "current databases, identities and marker were preserved",
+                    ):
+                        setup.finish_legacy_migration(installation, original)
+                    restore.assert_not_called()
+                saved = json.loads(
+                    (installation / "migration.pending.json").read_text()
+                )
+                self.assertEqual(saved["phase"], "activating" if late else "validating")
+                with self.assertRaisesRegex(RuntimeError, "remains closed"):
+                    setup.start(installation, meta)
+                if late:
+                    self.assertEqual(
+                        (root / "post-exposure-receipt").read_text(), "retained"
+                    )
+                    self.assertEqual(observed[0], [])
+                    self.assertTrue(observed[-1])
+                    with patch.object(setup, "no_players"), patch.object(
+                        setup, "migration_images", return_value=marker["runtimeImages"]
+                    ), patch.object(
+                        setup, "compose", return_value="namespace"
+                    ), patch.object(
+                        setup, "recreate_namespace"
+                    ), patch.object(
+                        setup, "stopped_state_probe", return_value='{"ok":true}'
+                    ), patch.object(
+                        setup,
+                        "payment_closure",
+                        return_value={"ok": True, "clear": True},
+                    ), patch.object(
+                        setup,
+                        "start",
+                        side_effect=RuntimeError("private validation unavailable"),
+                    ), patch.object(
+                        setup, "restore_data"
+                    ) as restore:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "marker were preserved"
+                        ):
+                            setup.finish_legacy_migration(installation, meta)
+                        restore.assert_not_called()
+                    self.assertEqual(
+                        json.loads(
+                            (installation / "migration.pending.json").read_text()
+                        )["phase"],
+                        "activating",
+                    )
+                    self.assertEqual(
+                        (root / "post-exposure-receipt").read_text(), "retained"
+                    )
+
+    def test_unfinished_migration_backups_cannot_bypass_fence_through_restore_or_recover(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            installation, original, meta, marker, safety = self.migration_fixture(root)
+            marker = setup.stage_legacy_migration(installation, marker, safety)
+            current = root / "current-backup"
+            self.backup_fixture(current, installation)
+            for name in marker["binding"]:
+                setup.private_file(current / name, (installation / name).read_bytes())
+            setup.private_file(
+                current / "compose.json", (installation / "compose.json").read_bytes()
+            )
+            setup.private_file(
+                current / "runtime-images.json", json.dumps(marker["runtimeImages"])
+            )
+            setup.write_migration(current, marker)
+            self.checksum_fixture(current)
+            setup.validate_backup(current)
+            target = root / "lost-installation"
+            with self.assertRaisesRegex(
+                RuntimeError, "Automatic recovery cannot discard"
+            ):
+                setup.recover_empty(target, current, meta["project"])
+            self.assertFalse(target.exists())
+            with self.assertRaisesRegex(
+                RuntimeError, "Automatic restore cannot discard"
+            ):
+                setup.restore(root / "other-installation", meta, current)
+            self.assertFalse((root / "other-installation").exists())
+
     @unittest.skipUnless(
         setup.shutil.which("node"), "Requires Node.js with node:sqlite"
     )
@@ -174,7 +1021,7 @@ class SetupSafety(unittest.TestCase):
             path = state / "bridge.sqlite"
             database = sqlite3.connect(path)
             database.executescript(
-                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE orders(state TEXT); INSERT INTO orders VALUES('complete');"
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE orders(state TEXT); INSERT INTO orders VALUES('complete'),('rejected'),('refunded');"
             )
             database.commit()
             database.close()
@@ -206,6 +1053,15 @@ class SetupSafety(unittest.TestCase):
             try:
                 database.execute("PRAGMA wal_autocheckpoint=0")
                 database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                database.executescript(
+                    "CREATE TABLE payment_discovery(id TEXT PRIMARY KEY); PRAGMA user_version=2;"
+                )
+                database.execute("INSERT INTO payment_discovery VALUES('orphan')")
+                database.commit()
+                probe(1)
+                database.execute("DELETE FROM payment_discovery")
+                database.commit()
+                probe(0)
                 database.execute("INSERT INTO orders VALUES('pending')")
                 database.commit()
                 self.assertGreater(Path(str(path) + "-wal").stat().st_size, 0)
@@ -222,8 +1078,31 @@ class SetupSafety(unittest.TestCase):
                 finally:
                     baseline.close()
                 probe(1)
+                for state_name in [
+                    "prepared",
+                    "fulfilled",
+                    "refund_required",
+                    "quarantined",
+                    "legacy_reconciliation",
+                ]:
+                    database.execute("INSERT INTO orders VALUES(?)", (state_name,))
+                database.commit()
+                probe(6)
             finally:
                 database.close()
+
+    def test_service_image_resolves_runnable_id_from_configured_tag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "compose.json").write_text(json.dumps({
+                "services": {"cards": {"image": "fixture:cards"}}
+            }))
+            with patch.object(setup, "run", return_value="sha256:runnable\n") as run:
+                self.assertEqual(setup.service_image_id(root, "cards"), "sha256:runnable")
+                run.assert_called_once_with(
+                    ["docker", "image", "inspect", "fixture:cards", "--format", "{{.Id}}"],
+                    capture=True,
+                )
 
     def test_backup_error_reports_checkpoint_and_restart_outcome_without_raw_error(
         self,
@@ -232,6 +1111,8 @@ class SetupSafety(unittest.TestCase):
             root = Path(directory)
             with patch.object(setup, "no_players"), patch.object(
                 setup, "archive_media"
+            ), patch.object(
+                setup, "service_image_id", return_value="fixture:image"
             ), patch.object(
                 setup, "compose", return_value="fixture:image"
             ), patch.object(
@@ -257,6 +1138,8 @@ class SetupSafety(unittest.TestCase):
                 self.assertNotIn("private-value", str(error.exception))
             with patch.object(setup, "no_players"), patch.object(
                 setup, "archive_media"
+            ), patch.object(
+                setup, "service_image_id", return_value="fixture:image"
             ), patch.object(
                 setup, "compose", return_value="fixture:image"
             ), patch.object(
@@ -285,7 +1168,7 @@ class SetupSafety(unittest.TestCase):
                 self.assertEqual(
                     stat.S_IMODE(path.stat().st_mode), 0o755 if path.is_dir() else 0o644
                 )
-            for name in ["doctor.mjs", "admin.mjs", "rewards.mjs"]:
+            for name in ["doctor.mjs", "admin.mjs", "rewards.mjs", "payments.mjs"]:
                 self.assertTrue((root / "bridge/tools" / name).is_file())
 
     def test_structured_command_error_retains_only_bounded_semantic_code(self):
@@ -645,20 +1528,10 @@ class SetupSafety(unittest.TestCase):
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            installation, source = root / "installation", root / "source"
-            installation.mkdir()
-            meta = self.backup_fixture(source, installation)
-            setup.private_file(
-                installation / "compose.json", (source / "compose.json").read_bytes()
+            installation, meta, candidate_meta, marker, source = self.migration_fixture(
+                root
             )
-            setup.private_file(
-                installation / "private/cards.env",
-                "ENABLE_SERIES_ONE_REWARDS=0\nASSET_ROOT=/assets\n",
-            )
-            setup.private_file(
-                installation / "private/catalog.json",
-                json.dumps(setup.managed_catalog()),
-            )
+            (installation / "migration.pending.json").unlink()
             setup.private_file(installation / "cosmic/pom.xml", "fixture")
             setup.private_file(
                 installation / "cosmic/config.yaml",
@@ -666,7 +1539,7 @@ class SetupSafety(unittest.TestCase):
             )
             observed = []
 
-            def start(path, _):
+            def start(path, _, **kwargs):
                 ports = json.loads((path / "compose.json").read_text())["services"][
                     "network"
                 ]["ports"]
@@ -678,6 +1551,8 @@ class SetupSafety(unittest.TestCase):
             with patch.object(setup, "no_players"), patch.object(
                 setup, "compose", return_value="0"
             ), patch.object(setup, "run"), patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(
                 setup, "bridge_snapshot", return_value="e" * 64
             ), patch.object(
                 setup, "lock_images", return_value=locks
@@ -688,6 +1563,10 @@ class SetupSafety(unittest.TestCase):
             ), patch.object(
                 setup, "start", side_effect=start
             ), patch.object(
+                setup, "stopped_state_probe_after_stop", return_value="0"
+            ), patch.object(
+                setup, "payment_closure", return_value={"ok": True, "clear": True}
+            ), patch.object(
                 setup, "restore_data"
             ) as restore:
                 with self.assertRaisesRegex(RuntimeError, "candidate data preserved"):
@@ -695,6 +1574,159 @@ class SetupSafety(unittest.TestCase):
                 restore.assert_not_called()
             self.assertEqual(observed[0], [])
             self.assertTrue(observed[1])
+
+    def test_ordinary_upgrade_atomic_interruptions_resume_without_discarding_data(self):
+        for checkpoint in [
+            "installation",
+            "locks",
+            "environment",
+            "closed",
+            "activation",
+        ]:
+            with self.subTest(
+                checkpoint=checkpoint
+            ), tempfile.TemporaryDirectory() as directory:
+                installation, original, meta, marker, safety = self.migration_fixture(
+                    Path(directory).resolve()
+                )
+                (installation / "migration.pending.json").unlink()
+                setup.private_file(
+                    installation / "private/cards.env", "STATE_KEY=fixture\n"
+                )
+                setup.private_file(safety / "private/cards.env", "STATE_KEY=fixture\n")
+                self.checksum_fixture(safety)
+                marker.update(
+                    kind="upgrade",
+                    oldBinding=setup.migration_binding(installation),
+                    backupDigest=setup.file_hash(safety / "checksums.json"),
+                )
+                values = setup.migration_staging_bytes(marker, safety)
+                marker["newBinding"] = {
+                    name: setup.hashlib.sha256(value).hexdigest()
+                    for name, value in values.items()
+                }
+                setup.write_migration(installation, marker)
+                replace = setup.os.replace
+                interrupted = []
+
+                def fault(source, destination):
+                    name = Path(destination).name
+                    data = Path(source).read_bytes()
+                    ports = (
+                        json.loads(data)["services"]["network"]["ports"]
+                        if name == "compose.json"
+                        else None
+                    )
+                    selected = (
+                        (checkpoint == "installation" and name == "installation.json")
+                        or (checkpoint == "locks" and name == "images.lock.json")
+                        or (checkpoint == "environment" and name == "cards.env")
+                        or (checkpoint == "closed" and ports == [])
+                        or (checkpoint == "activation" and bool(ports))
+                    )
+                    if selected and not interrupted:
+                        interrupted.append(True)
+                        Path(source).write_bytes(b"{")
+                        raise KeyboardInterrupt("interrupted atomic replacement")
+                    replace(source, destination)
+
+                with patch.object(setup, "no_players"), patch.object(
+                    setup, "migration_images", return_value=marker["runtimeImages"]
+                ), patch.object(setup, "compose"), patch.object(
+                    setup, "recreate_namespace"
+                ), patch.object(
+                    setup, "start"
+                ), patch.object(
+                    setup, "stopped_state_probe_after_stop", return_value="0"
+                ), patch.object(
+                    setup, "payment_closure", return_value={"ok": True, "clear": True}
+                ), patch.object(
+                    setup, "restore_data"
+                ) as restore:
+                    with patch.object(
+                        setup.os, "replace", side_effect=fault
+                    ), self.assertRaises(KeyboardInterrupt):
+                        setup.finish_ordinary_upgrade(installation, original)
+                    self.assertTrue(interrupted)
+                    pending = json.loads(
+                        (installation / "upgrade.pending.json").read_text()
+                    )
+                    self.assertIn(pending["phase"], ["staging", "activating"])
+                    json.loads((installation / "installation.json").read_text())
+                    json.loads((installation / "compose.json").read_text())
+                    (installation / "durable-new-receipt").write_text("retain")
+                    setup.finish_ordinary_upgrade(
+                        installation,
+                        json.loads((installation / "installation.json").read_text()),
+                    )
+                    restore.assert_not_called()
+                self.assertFalse((installation / "upgrade.pending.json").exists())
+                self.assertEqual(
+                    (installation / "durable-new-receipt").read_text(), "retain"
+                )
+                self.assertEqual(list(installation.rglob("*.migration-*")), [])
+
+    def test_ordinary_failed_rollback_keeps_durable_phase_for_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installation, original, meta, marker, safety = self.migration_fixture(
+                Path(directory).resolve()
+            )
+            (installation / "migration.pending.json").unlink()
+            marker["kind"] = "upgrade"
+            setup.write_migration(installation, marker)
+            with patch.object(setup, "no_players"), patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(setup, "compose"), patch.object(
+                setup, "recreate_namespace"
+            ), patch.object(
+                setup,
+                "start",
+                side_effect=RuntimeError("private validation unavailable"),
+            ), patch.object(
+                setup, "restore_data", side_effect=RuntimeError("rollback unavailable")
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "rollback remains incomplete"
+                ):
+                    setup.finish_ordinary_upgrade(installation, original)
+            self.assertEqual(
+                json.loads((installation / "upgrade.pending.json").read_text())[
+                    "phase"
+                ],
+                "rolling_back",
+            )
+            with self.assertRaisesRegex(RuntimeError, "finish-upgrade"):
+                setup.start(installation, meta)
+            with patch.object(setup, "no_players"), patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(setup, "restore_data") as restore:
+                setup.finish_ordinary_upgrade(installation, meta)
+                restore.assert_called_once_with(
+                    installation, original, safety, allow_upgrade=True
+                )
+            self.assertFalse((installation / "upgrade.pending.json").exists())
+
+    def test_ordinary_rollback_activation_retry_never_reimports_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installation, original, meta, marker, safety = self.migration_fixture(
+                Path(directory).resolve()
+            )
+            (installation / "migration.pending.json").unlink()
+            marker.update(kind="upgrade", phase="rollback_activating")
+            setup.write_migration(installation, marker)
+            (installation / "post-rollback-receipt").write_text("retain")
+            with patch.object(setup, "no_players"), patch.object(
+                setup, "migration_images", return_value=marker["runtimeImages"]
+            ), patch.object(setup, "activate_configuration") as activate, patch.object(
+                setup, "restore_data"
+            ) as restore:
+                setup.finish_ordinary_upgrade(installation, original)
+                restore.assert_not_called()
+                activate.assert_called_once()
+            self.assertEqual(
+                (installation / "post-rollback-receipt").read_text(), "retain"
+            )
+            self.assertFalse((installation / "upgrade.pending.json").exists())
 
     def test_original_static_media_survives_backup_restore_and_rejects_unsafe_members(
         self,
@@ -766,7 +1798,7 @@ class SetupSafety(unittest.TestCase):
                     database = sqlite3.connect(":memory:")
                     if name == "framework.sqlite":
                         database.executescript(
-                            "CREATE TABLE framework_state(id INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL,body TEXT NOT NULL); INSERT INTO framework_state VALUES(1,1,'fixture');"
+                            "CREATE TABLE framework_state(id INTEGER PRIMARY KEY,schema_version INTEGER NOT NULL,body TEXT); INSERT INTO framework_state VALUES(1,1,'fixture');"
                         )
                     else:
                         database.executescript(
@@ -1132,53 +2164,6 @@ class SetupSafety(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 setup.validate_backup(p)
 
-
-
-class NormalizedFrameworkCompatibility(unittest.TestCase):
-    def test_normalized_schema_guards_accept_two_through_eight_and_reject_corruption(self):
-        for version in range(2, 9):
-            with self.subTest(version=version):
-                con = sqlite3.connect(":memory:")
-                try:
-                    con.executescript(setup.normalized_schema_sql(version))
-                    marker = json.dumps({"format": "digital-card.indexed-state", "version": version, "recordKeys": "blind-v1"})
-                    con.execute("INSERT INTO framework_meta VALUES(1,?,?)", (version, marker))
-                    con.execute("PRAGMA user_version=" + str(version))
-                    setup.validate_database_schema(con, True)
-                    con.execute("UPDATE framework_meta SET schema_version=99")
-                    with self.assertRaises(RuntimeError): setup.validate_database_schema(con, True)
-                    con.execute("UPDATE framework_meta SET schema_version=?", (version,))
-                    con.execute("DROP INDEX framework_order")
-                    with self.assertRaises(RuntimeError): setup.validate_database_schema(con, True)
-                finally: con.close()
-
-    @unittest.skipUnless(setup.shutil.which("node"), "Requires Node.js with node:sqlite")
-    def test_actual_encrypted_schema_eight_backup_and_recovery_copy(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); state = root / "state"; work = root / "work"
-            state.mkdir(); work.mkdir()
-            module = (setup.ROOT / "node_modules/@digital-card/framework/src/sqlite.js").as_uri()
-            script = "import{SQLiteStore}from" + json.dumps(module) + ";const s=new SQLiteStore(process.argv[1],{encryptionKey:Buffer.alloc(32,7)});s.close();"
-            setup.subprocess.run([setup.shutil.which("node"),"--input-type=module","-e",script,str(state / "framework.sqlite")],check=True,capture_output=True)
-            bridge = sqlite3.connect(state / "bridge.sqlite")
-            bridge.executescript("CREATE TABLE orders(id TEXT PRIMARY KEY); CREATE TABLE registrations(code_id TEXT PRIMARY KEY); PRAGMA user_version=1;")
-            bridge.close()
-            con=sqlite3.connect(state / "framework.sqlite")
-            try: setup.validate_database_schema(con, True)
-            finally: con.close()
-            archive = root / "state.tar.gz"
-            with tarfile.open(archive, "w:gz") as files:
-                for name in ["framework.sqlite", "bridge.sqlite"]:
-                    files.add(state / name, arcname=name)
-            setup.validate_state_databases(archive)
-            for future in [False, True]:
-                if future:
-                    bridge=sqlite3.connect(state / "bridge.sqlite");bridge.execute("PRAGMA user_version=2");bridge.close()
-                before={p.name:setup.file_hash(p) for p in state.iterdir()}
-                result=setup.subprocess.run([setup.shutil.which("node"),"--input-type=module","-e",setup.recovery_state_probe_script(),str(state),str(work)],capture_output=True,text=True)
-                self.assertEqual(result.returncode == 0, not future, result.stderr)
-                self.assertEqual(before,{p.name:setup.file_hash(p) for p in state.iterdir()})
-                self.assertEqual(list(work.iterdir()),[])
 
 if __name__ == "__main__":
     unittest.main()

@@ -141,6 +141,18 @@ for rel, replacements in patches.items():
         raise SystemExit("Unsupported checkout: missing " + rel)
     text = file.read_text(encoding="utf-8")
     for old, new in replacements:
+        if (
+            rel.endswith("CouponCodeHandler.java")
+            and "if (server.cardbridge.BridgeRewards.handle(c, code)) return;" in text
+        ):
+            if (
+                text.count(
+                    "if (server.cardbridge.BridgeRewards.handle(c, code)) return;"
+                )
+                != 1
+            ):
+                raise SystemExit("Duplicate card code handler hook")
+            continue
         if new in text:
             continue
         if text.count(old) != 1:
@@ -384,7 +396,194 @@ if "public void bridgeNameChangePending()" not in proposed[character]:
         "    public boolean registerNameChange(String newName) {",
         1,
     )
+
+
+def financial_hook(rel, old, new):
+    file = base / rel
+    text = proposed.get(file, file.read_text(encoding="utf-8"))
+    if text.count(new) == 1:
+        return
+    if new in text or text.count(old) != 1:
+        raise SystemExit("Unsupported or conflicting financial hook: " + rel)
+    proposed[file] = text.replace(old, new, 1)
+
+
+financial_hook(
+    "src/main/java/net/server/channel/handlers/CouponCodeHandler.java",
+    "                if (server.cardbridge.BridgeRewards.handle(c, code)) return;",
+    "                if (server.cardbridge.BridgeRewards.handle(c, code)) return;\n                if (server.cardbridge.BridgeHttp.enabled()) { server.cardbridge.BridgeCoupons.handle(c, code); return; }",
+)
+financial_hook(
+    "src/main/java/net/server/channel/handlers/EnterCashShopHandler.java",
+    "            mc.getCashShop().open(true);\n            mc.saveCharToDB();",
+    "            mc.getCashShop().open(true);\n            if (server.cardbridge.BridgeHttp.enabled()) server.cardbridge.BridgeCoupons.recover(c);\n            mc.saveCharToDB();",
+)
+financial_hook(
+    "src/main/java/server/maps/MapItem.java",
+    "public class MapItem extends AbstractMapObject {",
+    "public class MapItem extends AbstractMapObject {\n    private final String cardAwardId = java.util.UUID.randomUUID().toString();\n    public String getCardAwardId() { return cardAwardId; }",
+)
+for indent in ["                                ", "                        "]:
+    old = indent + "this.getCashShop().gainCash(1, nxGain);"
+    financial_hook(
+        "src/main/java/client/Character.java",
+        old,
+        indent
+        + "if (server.cardbridge.BridgeHttp.enabled()) {\n"
+        + indent
+        + "    if (!server.cardbridge.BridgeAwards.loot(this, mapitem)) { sendPacket(PacketCreator.enableActions()); return; }\n"
+        + indent
+        + "} else this.getCashShop().gainCash(1, nxGain);",
+    )
+financial_hook(
+    "src/main/java/client/command/commands/gm4/ForceVacCommand.java",
+    "                    player.getCashShop().gainCash(1, mapItem.getItemId() == ItemId.NX_CARD_100 ? 100 : 250);",
+    "                    if (server.cardbridge.BridgeHttp.enabled()) {\n                        if (!server.cardbridge.BridgeAwards.loot(player, mapItem)) continue;\n                    } else player.getCashShop().gainCash(1, mapItem.getItemId() == ItemId.NX_CARD_100 ? 100 : 250);",
+)
+financial_hook(
+    "src/main/java/client/command/commands/gm3/GiveNxCommand.java",
+    "            victim.getCashShop().gainCash(type, value);",
+    "            if (server.cardbridge.BridgeHttp.enabled()) {\n                if (!server.cardbridge.BridgeAwards.grant(victim, type, value)) return;\n            } else victim.getCashShop().gainCash(type, value);",
+)
+for case in ["case 16: { //buy", "case 17: { //buy from cart"]:
+    old = (
+        "            "
+        + case
+        + "\n                int id = p.readInt(); // id of the item"
+    )
+    financial_hook(
+        "src/main/java/net/server/channel/handlers/MTSHandler.java",
+        old,
+        old
+        + "\n                if (server.cardbridge.BridgeHttp.enabled()) {\n                    server.cardbridge.BridgeAwards.mts(c, id);\n                    c.sendPacket(PacketCreator.showMTSCash(c.getPlayer()));\n                    c.sendPacket(PacketCreator.transferInventory(getTransfer(c.getPlayer().getId())));\n                    c.sendPacket(PacketCreator.notYetSoldInv(getNotYetSold(c.getPlayer().getId())));\n                    break;\n                }",
+    )
+financial_hook(
+    "src/main/java/net/server/channel/handlers/CashOperationHandler.java",
+    "                        Item item = cItem.toItem();\n                        cs.gainCash(useNX, cItem, chr.getWorld());",
+    "                        if (server.cardbridge.BridgeHttp.enabled()) {\n                            if (server.cardbridge.BridgeNativePurchases.buy(c, useNX, cItem, false) && !YamlConfig.config.server.USE_ENFORCE_ITEM_SUGGESTION) Server.getInstance().getWorld(chr.getWorld()).addCashItemBought(cItem.getSN());\n                            return;\n                        }\n                        Item item = cItem.toItem();\n                        cs.gainCash(useNX, cItem, chr.getWorld());",
+)
+financial_hook(
+    "src/main/java/net/server/channel/handlers/CashOperationHandler.java",
+    "                    } else { // Package\n                        cs.gainCash(useNX, cItem, chr.getWorld());",
+    "                    } else { // Package\n                        if (server.cardbridge.BridgeHttp.enabled()) {\n                            if (server.cardbridge.BridgeNativePurchases.buy(c, useNX, cItem, true) && !YamlConfig.config.server.USE_ENFORCE_ITEM_SUGGESTION) Server.getInstance().getWorld(chr.getWorld()).addCashItemBought(cItem.getSN());\n                            return;\n                        }\n                        cs.gainCash(useNX, cItem, chr.getWorld());",
+)
+financial_hook(
+    "src/main/java/net/server/Server.java",
+    "        long timeClear = System.currentTimeMillis() - DAYS.toMillis(14);",
+    "        long timeClear = System.currentTimeMillis() - DAYS.toMillis(14);\n        if (BridgeHttp.enabled()) { server.cardbridge.BridgeCoupons.clean(con, timeClear); return; }",
+)
+financial_hook(
+    "src/main/java/client/Character.java",
+    "    public static Character loadCharFromDB(final int charid, Client client, boolean channelserver) throws SQLException {",
+    "    public static Character loadCharFromDB(final int charid, Client client, boolean channelserver) throws SQLException {\n        if (!server.cardbridge.BridgeHttp.enabled()) return bridgeLoadCharFromDB(charid, client, channelserver);\n        try (server.cardbridge.BridgeCharacters.Guard guard = server.cardbridge.BridgeCharacters.load(charid)) {\n            Character loaded = bridgeLoadCharFromDB(charid, client, channelserver);\n            guard.validate(loaded);\n            if (channelserver) server.cardbridge.BridgeCharacters.activate(loaded);\n            return loaded;\n        }\n    }\n\n    private static Character bridgeLoadCharFromDB(final int charid, Client client, boolean channelserver) throws SQLException {",
+)
+# Keep the transaction hooks inside the supported synchronized save method.
+text = proposed[character]
+if "BridgeCharacters.save(this)" not in text:
+    code = masked_java(text)
+    match = re.search(
+        r"public\s+synchronized\s+void\s+saveCharToDB\s*\(\s*boolean\s+notAutosave\s*\)",
+        code,
+    )
+    start = code.find("{", match.end())
+    depth, end = 1, start + 1
+    while depth:
+        depth += (code[end] == "{") - (code[end] == "}")
+        end += 1
+    text = (
+        text[: start + 1]
+        + "\n        try (server.cardbridge.BridgeCharacters.Guard guard = server.cardbridge.BridgeCharacters.save(this)) {\n            if (server.cardbridge.BridgeHttp.enabled() && !server.cardbridge.BridgeCharacters.current(this)) return;"
+        + text[start + 1 : end - 1]
+        + "        }\n    "
+        + text[end - 1 :]
+    )
+    proposed[character] = patch_character_save(text)
+elif text.count("BridgeCharacters.save(this)") != 1:
+    raise SystemExit("Conflicting character ownership guard")
+financial_hook(
+    "src/main/java/server/CashShop.java",
+    "        public static List<Item> getPackage(int itemId) {",
+    "        public static List<Integer> getPackageSerials(int itemId) {\n            List<Integer> serials = packages.get(itemId);\n            return serials == null ? List.of() : List.copyOf(serials);\n        }\n\n        public static List<Item> getPackage(int itemId) {",
+)
+
+financial_hook(
+    "src/main/java/server/CashShop.java",
+    "    public int getAvailableNotes() {",
+    "    public void bridgeAddGiftNotes(int count) { notes += count; }\n\n    public int getAvailableNotes() {",
+)
+financial_hook(
+    "src/main/java/server/Storage.java",
+    "    public byte getSlots() {",
+    '    public void bridgeSetSlots(int value) {\n        if (value < 0 || value > 48) throw new IllegalArgumentException("Invalid storage slots");\n        lock.lock();\n        try { slots = (byte) value; } finally { lock.unlock(); }\n    }\n\n    public byte getSlots() {',
+)
+financial_hook(
+    "src/main/java/net/server/channel/handlers/EnterCashShopHandler.java",
+    "            c.sendPacket(PacketCreator.showGifts(mc.getCashShop().loadGifts()));",
+    "            c.sendPacket(PacketCreator.showGifts(server.cardbridge.BridgeHttp.enabled() ? server.cardbridge.BridgeNativePurchases.receiveGifts(c) : mc.getCashShop().loadGifts()));",
+)
+financial_hook(
+    "src/main/java/net/server/channel/handlers/CashOperationHandler.java",
+    '                    cs.gainCash(4, cItem, chr.getWorld());\n                    cs.gift(Integer.parseInt(recipient.get("id")), chr.getName(), message, cItem.getSN());',
+    '                    if (server.cardbridge.BridgeHttp.enabled()) {\n                        if (!server.cardbridge.BridgeNativePurchases.gift(c, cItem, Integer.parseInt(recipient.get("id")), message)) return;\n                    } else {\n                        cs.gainCash(4, cItem, chr.getWorld());\n                        cs.gift(Integer.parseInt(recipient.get("id")), chr.getName(), message, cItem.getSN());\n                    }',
+)
+for old, route in [
+    (
+        "                        cs.gainCash(cash, -4000);\n                        if (chr.gainSlots(type, qty, false)) {",
+        "1, type, qty",
+    ),
+    (
+        "                        cs.gainCash(cash, cItem, chr.getWorld());\n                        if (chr.gainSlots(type, qty, false)) {",
+        "1, type, qty",
+    ),
+    (
+        "                        cs.gainCash(cash, -4000);\n                        if (chr.getStorage().gainSlots(qty)) {",
+        "2, 0, qty",
+    ),
+    (
+        "                        cs.gainCash(cash, cItem, chr.getWorld());\n                        if (chr.getStorage().gainSlots(qty)) {",
+        "2, 0, qty",
+    ),
+    (
+        "                    cs.gainCash(cash, cItem, chr.getWorld());\n                    if (c.gainCharacterSlot()) {",
+        "3, 0, 1",
+    ),
+]:
+    indent = old[: len(old) - len(old.lstrip())]
+    offer = "null" if "-4000" in old else "cItem"
+    financial_hook(
+        "src/main/java/net/server/channel/handlers/CashOperationHandler.java",
+        old,
+        indent
+        + "if (server.cardbridge.BridgeHttp.enabled()) { server.cardbridge.BridgeNativePurchases.slots(c, cash, "
+        + offer
+        + ", "
+        + route
+        + "); return; }\n"
+        + old,
+    )
+financial_hook(
+    "src/main/java/net/server/channel/handlers/MTSHandler.java",
+    "        // TODO add karma-to-untradeable flag on sold items here",
+    "        // TODO add karma-to-untradeable flag on sold items here\n        if (server.cardbridge.BridgeHttp.enabled() && !config.YamlConfig.config.server.USE_MTS) { c.enableCSActions(); return; }",
+)
+
+financial_hook(
+    "src/main/java/server/CashShop.java",
+    "        public static List<Integer> getPackageSerials(int itemId) {",
+    "        public static CashItem bridgeFixedSlotOffer() { return new CashItem(0, 0, 4000, 0, (short) 1, true); }\n\n        public static List<Integer> getPackageSerials(int itemId) {",
+)
+
 # Validate every hook before writing any part of the installation.
+financial_hook(
+    "scripts/npc/1022101_old.js",
+    "var choice;",
+    "var choice;\nvar cardExchangeKey = Java.type('java.util.UUID').randomUUID().toString();",
+)
+financial_hook(
+    "scripts/npc/1022101_old.js",
+    "                // Leaf for Cash\n                if (useVP) {",
+    "                // Leaf for Cash\n                const CardExchangeBridge = Java.type('server.cardbridge.BridgeExchanges');\n                if (Java.type('server.cardbridge.BridgeHttp').enabled()) {\n                    if (CardExchangeBridge.exchange(cm.getClient(), useVP, itemToUse, nxAmount, cardExchangeKey)) {\n                        cm.sendOk('Your exchange has been completed.');\n                    } else {\n                        cm.sendOk('Your exchange is unavailable or awaiting save confirmation. Please check your balance and inventory.');\n                    }\n                    cm.dispose();\n                    return;\n                }\n                if (useVP) {",
+)
 if not args.check:
     for file, text in proposed.items():
         file.write_text(text, encoding="utf-8", newline="\n")

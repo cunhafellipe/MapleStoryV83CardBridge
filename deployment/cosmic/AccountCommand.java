@@ -1,8 +1,6 @@
 import com.google.gson.*;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.sql.*;
-import java.util.HexFormat;
 import java.util.UUID;
 import tools.BCrypt;
 import tools.DatabaseConnection;
@@ -57,86 +55,15 @@ public final class AccountCommand {
   }
 
   private static void fund(Connection con, String name, JsonObject input) throws Exception {
+    for (String field : new String[] {"cashType", "amount"}) {
+      if (!input.has(field)
+          || !input.get(field).isJsonPrimitive()
+          || !input.get(field).getAsJsonPrimitive().isNumber()
+          || !input.get(field).getAsString().matches("[1-9][0-9]{0,8}"))
+        throw new IllegalArgumentException("Invalid funding amount or cash source");
+    }
     int type = input.get("cashType").getAsInt(), amount = input.get("amount").getAsInt();
-    if (amount < 1 || amount > 100000000)
-      throw new IllegalArgumentException("Invalid funding amount");
-    String field =
-        switch (type) {
-          case 1 -> "nxCredit";
-          case 2 -> "maplePoint";
-          case 4 -> "nxPrepaid";
-          default -> throw new IllegalArgumentException("Invalid cash type");
-        };
     String key = input.has("key") ? input.get("key").getAsString() : UUID.randomUUID().toString();
-    if (!key.matches("[A-Za-z0-9._:-]{1,128}"))
-      throw new IllegalArgumentException("Invalid funding request ID");
-    try (Statement st = con.createStatement()) {
-      st.execute(
-          "CREATE TABLE IF NOT EXISTS card_bridge_operator_funding(request_id CHAR(64) PRIMARY"
-              + " KEY,account_id INT NOT NULL,cash_type INT NOT NULL,amount INT NOT"
-              + " NULL,balance_after INT NOT NULL,created_at TIMESTAMP NOT NULL DEFAULT"
-              + " CURRENT_TIMESTAMP) ENGINE=InnoDB");
-    }
-    con.setAutoCommit(false);
-    try {
-      int account, balance;
-      try (PreparedStatement ps =
-          con.prepareStatement(
-              "SELECT id,COALESCE(" + field + ",0) FROM accounts WHERE name=? FOR UPDATE")) {
-        ps.setString(1, name);
-        try (ResultSet rs = ps.executeQuery()) {
-          if (!rs.next()) throw new IllegalStateException("Account unavailable");
-          account = rs.getInt(1);
-          balance = rs.getInt(2);
-        }
-      }
-      String request =
-          HexFormat.of()
-              .formatHex(
-                  MessageDigest.getInstance("SHA-256")
-                      .digest(
-                          ("operator-fund\n" + account + "\n" + key)
-                              .getBytes(StandardCharsets.UTF_8)));
-      try (PreparedStatement ps =
-          con.prepareStatement(
-              "SELECT account_id,cash_type,amount FROM card_bridge_operator_funding WHERE"
-                  + " request_id=?")) {
-        ps.setString(1, request);
-        try (ResultSet rs = ps.executeQuery()) {
-          if (rs.next()) {
-            if (rs.getInt(1) != account || rs.getInt(2) != type || rs.getInt(3) != amount)
-              throw new IllegalStateException("Funding request ID has different terms");
-            con.commit();
-            return;
-          }
-        }
-      }
-      if (balance < 0 || (long) balance + amount > Integer.MAX_VALUE)
-        throw new IllegalStateException("Balance unavailable");
-      try (PreparedStatement ps =
-          con.prepareStatement("UPDATE accounts SET " + field + "=? WHERE id=?")) {
-        ps.setInt(1, balance + amount);
-        ps.setInt(2, account);
-        ps.executeUpdate();
-      }
-      try (PreparedStatement ps =
-          con.prepareStatement(
-              "INSERT INTO"
-                  + " card_bridge_operator_funding(request_id,account_id,cash_type,amount,balance_after)"
-                  + " VALUES(?,?,?,?,?)")) {
-        ps.setString(1, request);
-        ps.setInt(2, account);
-        ps.setInt(3, type);
-        ps.setInt(4, amount);
-        ps.setInt(5, balance + amount);
-        ps.executeUpdate();
-      }
-      con.commit();
-    } catch (Exception error) {
-      con.rollback();
-      throw error;
-    } finally {
-      con.setAutoCommit(true);
-    }
+    server.cardbridge.BridgeAwards.operatorFund(con, name, type, amount, key);
   }
 }

@@ -16,6 +16,7 @@ try {
     result.callbackReady !== true ||
     result.leaseReady !== true ||
     result.storage?.ok !== true
+    || result.paymentProtocol !== "cosmic-payments/1"
   )
     throw Error(result.code ?? "NOT_READY");
   if (process.env.GAME_SHARED_KEY && process.env.GAME_URL) {
@@ -24,7 +25,7 @@ try {
       secret: process.env.GAME_SHARED_KEY,
     });
     const health = await game("/health", {});
-    if (!health.callbackReady || !health.leaseReady)
+    if (!health.callbackReady || !health.leaseReady || health.paymentProtocol !== "cosmic-payments/1")
       throw Error("CALLBACK_OR_LEASE_UNAVAILABLE");
   }
   if (!quiet)

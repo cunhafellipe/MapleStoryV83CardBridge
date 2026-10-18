@@ -80,6 +80,14 @@ test("readiness requires the game, matching account mode and a verified callback
   h.x.faults.health = false;
   h.x.faults.sessionSource = "grove";
   assert.equal((await fetch(h.base + "/api/library/health")).status, 503);
+  h.x.faults.sessionSource = "bridge";
+  const original = h.x.game;
+  h.x.game = async (path, input) => {
+    const result = await original(path, input);
+    if (path === "/health") delete result.paymentProtocol;
+    return result;
+  };
+  assert.equal((await fetch(h.base + "/api/library/health")).status, 503);
 });
 test("callback probes require the exact signed body and do not change code state", async (t) => {
   const h = await httpFixture(t),

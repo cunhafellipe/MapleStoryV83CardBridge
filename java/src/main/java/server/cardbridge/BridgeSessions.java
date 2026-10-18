@@ -21,13 +21,18 @@ public final class BridgeSessions {
             con.prepareStatement(
                 "SELECT id,name FROM accounts WHERE "
                     + (name != null ? "name=?" : "id=?")
-                    + " AND banned=0 AND tempban<=UTC_TIMESTAMP()")) {
+                    + " AND banned=0 AND tempban<=UTC_TIMESTAMP() FOR UPDATE")) {
+      con.setAutoCommit(false);
       if (name != null) ps.setString(1, name);
       else ps.setInt(1, accountId);
       try (ResultSet rs = ps.executeQuery()) {
         if (!rs.next())
           throw new BridgeHttp.Problem(404, "ACCOUNT_UNAVAILABLE", "The account is unavailable.");
-        return Map.of("accountId", rs.getInt(1), "name", rs.getString(2));
+        int id = rs.getInt(1);
+        String savedName = rs.getString(2);
+        BridgePayments.assertLiveIdentity(con, id);
+        con.commit();
+        return Map.of("accountId", id, "name", savedName);
       }
     }
   }
@@ -72,7 +77,8 @@ public final class BridgeSessions {
         PreparedStatement ps =
             con.prepareStatement(
                 "SELECT id,name,password FROM accounts WHERE name=? AND banned=0 AND"
-                    + " tempban<=UTC_TIMESTAMP()")) {
+                    + " tempban<=UTC_TIMESTAMP() FOR UPDATE")) {
+      con.setAutoCommit(false);
       ps.setString(1, name);
       try (ResultSet rs = ps.executeQuery()) {
         if (!rs.next() || !passwordMatches(password, rs.getString(3)))
@@ -81,6 +87,7 @@ public final class BridgeSessions {
         account = rs.getInt(1);
         canonical = rs.getString(2);
       }
+      BridgePayments.assertLiveIdentity(con, account);
       try (PreparedStatement insert =
           con.prepareStatement(
               "INSERT INTO card_bridge_sessions(token_hash,account_id,expires_at) VALUES(?,?,?)")) {
@@ -95,6 +102,7 @@ public final class BridgeSessions {
         cleanup.setLong(1, System.currentTimeMillis());
         cleanup.executeUpdate();
       }
+      con.commit();
     }
     return Map.of("accountId", account, "name", canonical);
   }
@@ -110,14 +118,19 @@ public final class BridgeSessions {
                 + " s.token_hash=? AND s.expires_at>UTC_TIMESTAMP() AND a.banned=0 AND"
                 + " a.tempban<=UTC_TIMESTAMP()";
     try (Connection con = DatabaseConnection.getConnection();
-        PreparedStatement ps = con.prepareStatement(sql)) {
+        PreparedStatement ps = con.prepareStatement(sql + " FOR UPDATE")) {
+      con.setAutoCommit(false);
       ps.setString(1, hash);
       if (nativeSessions()) ps.setLong(2, System.currentTimeMillis());
       try (ResultSet rs = ps.executeQuery()) {
         if (!rs.next())
           throw new BridgeHttp.Problem(
               401, "UNAUTHENTICATED", "Please sign in to your game account.");
-        return Map.of("accountId", rs.getInt(1), "name", rs.getString(2));
+        int id = rs.getInt(1);
+        String savedName = rs.getString(2);
+        BridgePayments.assertLiveIdentity(con, id);
+        con.commit();
+        return Map.of("accountId", id, "name", savedName);
       }
     }
   }

@@ -11,6 +11,7 @@ import { createLibraryHttp } from "./http.mjs";
 import { generateSeriesOneCode } from "./series-one.mjs";
 import { validateWebsiteCatalog } from "./administration.mjs";
 import { seriesOnePool } from "./reward-configuration.mjs";
+import { PaymentAuthority, paymentProviderId } from "./payment-authority.mjs";
 const env = (name) => {
   if (!process.env[name]) throw Error("Missing " + name);
   return process.env[name];
@@ -31,10 +32,12 @@ const vault = createCodeVault({
   indexKey: key32("CODE_INDEX_KEY"),
 });
 const rewardsEnabled = process.env.ENABLE_SERIES_ONE_REWARDS === "1";
+const paymentAuthority = new PaymentAuthority();
 const core = new CardFramework({
   store,
   codeVault: vault,
   codeGenerators: rewardsEnabled ? { "series-one": generateSeriesOneCode } : {},
+  externalPurchaseProviders: { [paymentProviderId]: paymentAuthority },
 });
 const journal = new Journal(join(state, "bridge.sqlite"));
 const current = store.read((s) => s.catalog?.version ?? 0);
@@ -63,6 +66,7 @@ const library = new Library({
   game,
   acceptedCashTypes: acceptedTypes(process.env.ACCEPTED_CASH_TYPES),
   rewardsEnabled,
+  paymentAuthority,
 });
 const server = createLibraryHttp({
   library,

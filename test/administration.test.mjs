@@ -129,7 +129,7 @@ test("catalog publication cannot slip into the awaited payment interval", async 
     const entered = new Promise((r) => (started = r)),
       gate = new Promise((r) => (release = r));
     x.library.game = async (path, value) => {
-      if (path === "/debit") {
+      if (path === "/payment/debit") {
         started();
         await gate;
       }
@@ -183,7 +183,7 @@ test("queued operator retry rechecks revocation and expiry before any economic e
       const started = new Promise((r) => (entered = r)),
         gate = new Promise((r) => (release = r));
       x.library.game = async (path, value) => {
-        if (path === "/debit" && value.accountId === x.person.accountId) {
+        if (path === "/payment/debit" && value.accountId === x.person.accountId) {
           entered();
           await gate;
         }

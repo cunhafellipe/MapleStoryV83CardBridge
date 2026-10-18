@@ -274,11 +274,10 @@ export class Administration {
             "The submitted preview differs from the reviewed draft.",
             409,
           );
-      // Let the framework verify an exact committed replay after response loss.
-      if (
-        this.revision() !== preview.adminRevision &&
-        this.library.core.catalog().version <= preview.expectedVersion
-      )
+      // A newer catalog makes a fresh import with this old version impossible;
+      // allow the framework to verify an exact committed replay after response loss.
+      if (this.revision() !== preview.adminRevision &&
+          this.library.core.catalog().version <= preview.expectedVersion)
         fail(
           "STALE_IMPORT",
           "Administrator policy changed; preview again.",
@@ -324,7 +323,7 @@ export class Administration {
     return {
       catalogVersion: this.library.core.catalog().version,
       adminRevision: this.revision(),
-      gameReady: game.ok === true,
+      gameReady: game.ok === true && game.paymentProtocol === "cosmic-payments/1",
       leaseReady: game.leaseReady === true,
       callbackReady: game.callbackReady === true,
       gameDiagnostics:
@@ -336,6 +335,7 @@ export class Administration {
       storage: this.library.readiness(),
       ...this.library.journal.diagnostics(),
       lastRecovery: this.library.lastRecovery ?? null,
+      unmatchedPayments: this.library.journal.paymentDiscoveryPage({ limit: 25 }),
       recentActivity: this.library.journal.activityPage({ limit: 10 }).items,
     };
   }
@@ -373,6 +373,7 @@ export class Administration {
         quantity: o.input.quantity,
         cashType: o.input.cashType,
         amount: o.quote.price.amount,
+        failureCode: o.failureCode ?? null,
         attempts: o.attempts ?? 0,
         lastError: o.lastError ?? null,
         lastAttemptAt: o.lastAttemptAt ?? null,
